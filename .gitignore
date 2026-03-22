@@ -1,0 +1,81 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+sdist/
+.eggs/
+*.whl
+*.tar.gz
+pip-wheel-metadata/
+pip-log.txt
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Testing & coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# --- Type checkers / linters ---
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Data (large / generated) ---
+data/adelaide_osm.gpkg
+data/*.gpkg
+*.gpkg
+
+# --- Caches ---
+cache/
+.cache/
+*.json.cache
+
+# --- Logs ---
+*.log
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+credentials.json
+*.pem
+*.key
+
+# --- OpenCode ---
+.opencode/
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Streamlit ---
+.streamlit/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.Trash-*

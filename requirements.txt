@@ -1,0 +1,9 @@
+streamlit>=1.30
+folium>=0.15
+geopandas>=0.14
+osmnx>=2.0
+shapely>=2.0
+ollama>=0.3
+sqlparse>=0.5
+pyogrio>=0.7
+python-dotenv>=1.0
