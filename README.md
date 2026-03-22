@@ -243,6 +243,6 @@ graph LR
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+This project is licensed under the Business Source License 1.1 (`BUSL-1.1`). Non-production use is permitted under the license terms; production or commercial use requires separate authorization until the applicable Change Date. See [LICENSE](LICENSE) for details.
 
 Map data from [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors, available under the [ODbL](https://opendatacommons.org/licenses/odbl/).
