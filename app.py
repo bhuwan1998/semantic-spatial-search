@@ -9,13 +9,15 @@ import os
 
 from dotenv import load_dotenv
 import folium
+from folium import plugins
 import geopandas as gpd
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit_js_eval import get_geolocation
 
 from core.schema import introspect_gpkg, format_schema_for_llm, get_table_names
-from core.llm import generate_sql
+from core.llm import generate_sql, query_requires_device_location
 from core.executor import execute_query
 from core.geocoder import get_adelaide_center
 
@@ -30,10 +32,7 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 BASEMAP_OPTIONS = {
     "Dark (CartoDB Dark Matter)": "CartoDB dark_matter",
     "Light (CartoDB Positron)": "CartoDB positron",
-    "OpenStreetMap": "OpenStreetMap",
-    "Satellite (Esri WorldImagery)": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-    "Topo (OpenTopoMap)": "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
-    "Watercolor (Stamen)": "https://tiles.stadiamaps.com/tiles/stamen_watercolor/{z}/{x}/{y}.jpg",
+    "OpenStreetMap": "OpenStreetMap"
 }
 
 # Attribution strings for custom tile URLs
@@ -68,7 +67,95 @@ EXAMPLE_QUERIES = [
     "What landuse types are near Adelaide Airport?",
     "Find pharmacies near North Adelaide",
     "Show railway lines",
+    "Find parks near me",
 ]
+
+
+def get_device_location(
+    component_key: str,
+) -> tuple[tuple[float, float] | None, str | None, bool]:
+    """Request the browser's geolocation and normalize the response."""
+    location = get_geolocation(component_key=component_key)
+
+    if not location:
+        return None, None, True
+
+    if "error" in location:
+        error = location["error"]
+        code = error.get("code")
+        message = error.get("message", "Unknown geolocation error.")
+
+        if code == 1:
+            return None, (
+                "Location permission was denied. "
+                "Allow browser location access to search near you."
+            ), False
+        return None, f"Unable to retrieve device location: {message}", False
+
+    coords = location.get("coords", {})
+    latitude = coords.get("latitude")
+    longitude = coords.get("longitude")
+
+    if latitude is None or longitude is None:
+        return None, "Unable to read device coordinates from the browser response.", False
+
+    return (latitude, longitude), None, False
+
+
+def execute_search(
+    user_query: str,
+    schema_text: str,
+    table_names: set[str],
+    device_coords: tuple[float, float] | None = None,
+):
+    """Generate SQL, execute it, and store results in session state."""
+    with st.spinner("Generating spatial SQL..."):
+        sql, error = generate_sql(
+            user_query=user_query,
+            schema_context=schema_text,
+            allowed_tables=table_names,
+            device_coords=device_coords,
+            model=OLLAMA_MODEL,
+        )
+
+    if error:
+        st.session_state["last_error"] = f"SQL Generation Error: {error}"
+        return
+
+    st.session_state["last_sql"] = sql
+
+    with st.spinner("Executing query..."):
+        result = execute_query(GPKG_PATH, sql)
+
+    if result.error:
+        st.session_state["last_error"] = f"Execution Error: {result.error}"
+        st.session_state["last_sql"] = sql
+        return
+
+    st.session_state["last_row_count"] = result.row_count
+    st.session_state["last_has_geometry"] = result.has_geometry
+
+    if result.has_geometry and result.gdf is not None and not result.gdf.empty:
+        selected_basemap = st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)")
+        st.session_state["last_map_html"] = build_map_html(
+            result.gdf,
+            selected_basemap,
+            device_coords=st.session_state.get("device_location"),
+        )
+        st.session_state["last_gdf"] = result.gdf
+        st.session_state["last_basemap"] = selected_basemap
+        st.session_state["last_table_df"] = result.gdf.drop(
+            columns=["geometry"], errors="ignore"
+        ).reset_index(drop=True)
+        st.session_state["last_geom_types"] = result.gdf.geom_type.unique().tolist()
+    elif result.raw_rows:
+        st.session_state["last_table_df"] = pd.DataFrame(result.raw_rows)
+
+    st.session_state["query_history"].append({
+        "query": user_query,
+        "sql": sql,
+        "count": result.row_count,
+    })
 
 
 def setup_page():
@@ -121,21 +208,76 @@ def _create_base_map(basemap_name: str) -> folium.Map:
     return m
 
 
-def build_default_map_html(basemap_name: str) -> str:
+def _add_current_location_controls(
+    m: folium.Map,
+    device_coords: tuple[float, float] | None = None,
+):
+    """Add current-location controls and overlays to the map."""
+    plugins.LocateControl(
+        auto_start=False,
+        flyTo=True,
+        keepCurrentZoomLevel=False,
+        showCompass=True,
+        strings={"title": "Show my location"},
+    ).add_to(m)
+
+    if device_coords is None:
+        return
+
+    lat, lng = device_coords
+    folium.CircleMarker(
+        location=[lat, lng],
+        radius=9,
+        color="#111827",
+        weight=2,
+        fill=True,
+        fill_color="#f59e0b",
+        fill_opacity=0.95,
+        tooltip="Your current location",
+        popup=folium.Popup("Your current location", max_width=220),
+    ).add_to(m)
+    folium.Circle(
+        location=[lat, lng],
+        radius=250,
+        color="#f59e0b",
+        weight=2,
+        fill=True,
+        fill_color="#fbbf24",
+        fill_opacity=0.12,
+    ).add_to(m)
+
+
+def build_default_map_html(
+    basemap_name: str,
+    device_coords: tuple[float, float] | None = None,
+) -> str:
     """Build a default Folium map centered on Adelaide with no overlays."""
     m = _create_base_map(basemap_name)
+    _add_current_location_controls(m, device_coords)
     folium.LayerControl(collapsed=False).add_to(m)
     return m._repr_html_()
 
 
-def build_map_html(gdf: gpd.GeoDataFrame, basemap_name: str) -> str:
+def build_map_html(
+    gdf: gpd.GeoDataFrame,
+    basemap_name: str,
+    device_coords: tuple[float, float] | None = None,
+) -> str:
     """Build a Folium map and return its HTML string."""
     m = _create_base_map(basemap_name)
+    _add_current_location_controls(m, device_coords)
 
     if gdf is not None and not gdf.empty:
         # Auto-fit bounds to data
         bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
-        m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+        fit_bounds = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
+        if device_coords is not None:
+            lat, lng = device_coords
+            fit_bounds[0][0] = min(fit_bounds[0][0], lat)
+            fit_bounds[0][1] = min(fit_bounds[0][1], lng)
+            fit_bounds[1][0] = max(fit_bounds[1][0], lat)
+            fit_bounds[1][1] = max(fit_bounds[1][1], lng)
+        m.fit_bounds(fit_bounds)
 
         # Add features to map
         for idx, row in gdf.iterrows():
@@ -294,6 +436,14 @@ def main():
         st.session_state["last_gdf"] = None
     if "last_basemap" not in st.session_state:
         st.session_state["last_basemap"] = None
+    if "device_location" not in st.session_state:
+        st.session_state["device_location"] = None
+    if "pending_location_query" not in st.session_state:
+        st.session_state["pending_location_query"] = None
+    if "location_request_key" not in st.session_state:
+        st.session_state["location_request_key"] = 0
+    if "show_my_location_request" not in st.session_state:
+        st.session_state["show_my_location_request"] = False
 
     # If an example query was clicked, pre-fill the input
     default_value = st.session_state.pop("pending_query", "")
@@ -309,6 +459,10 @@ def main():
     col1, col2 = st.columns([1, 5])
     with col1:
         run_button = st.button("Search", type="primary", width="stretch")
+    with col2:
+        if st.button("Show My Location", width="content"):
+            st.session_state["show_my_location_request"] = True
+            st.rerun()
 
     # Process query -- only regenerate SQL + execute on button click
     if run_button and user_query and user_query.strip():
@@ -321,55 +475,88 @@ def main():
         st.session_state["last_error"] = None
         st.session_state["last_geom_types"] = []
 
-        # Generate SQL
-        with st.spinner("Generating spatial SQL..."):
-            sql, error = generate_sql(
-                user_query=user_query,
-                schema_context=schema_text,
-                allowed_tables=table_names,
-                model=OLLAMA_MODEL,
-            )
+        device_coords = None
+        if query_requires_device_location(user_query):
+            request_key = f"geo_request_{st.session_state['location_request_key']}"
+            with st.spinner("Requesting your device location..."):
+                device_coords, location_error, waiting_for_location = get_device_location(
+                    component_key=request_key
+                )
 
-        if error:
-            st.session_state["last_error"] = f"SQL Generation Error: {error}"
-        else:
-            st.session_state["last_sql"] = sql
-
-            # Execute query
-            with st.spinner("Executing query..."):
-                result = execute_query(GPKG_PATH, sql)
-
-            if result.error:
-                st.session_state["last_error"] = f"Execution Error: {result.error}"
-                st.session_state["last_sql"] = sql
+            if waiting_for_location:
+                st.session_state["pending_location_query"] = user_query
+                st.info("Waiting for your browser to return device location...")
+                st.rerun()
+            elif location_error:
+                st.session_state["last_error"] = location_error
+                st.session_state["device_location"] = None
+                st.session_state["pending_location_query"] = None
             else:
-                st.session_state["last_row_count"] = result.row_count
-                st.session_state["last_has_geometry"] = result.has_geometry
+                st.session_state["device_location"] = device_coords
+                st.session_state["pending_location_query"] = None
+                st.session_state["location_request_key"] += 1
 
-                if result.has_geometry and result.gdf is not None and not result.gdf.empty:
-                    # Pre-render map to HTML and store the string
-                    selected_basemap = st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)")
-                    st.session_state["last_map_html"] = build_map_html(result.gdf, selected_basemap)
-                    st.session_state["last_gdf"] = result.gdf
-                    st.session_state["last_basemap"] = selected_basemap
-                    # Store table data (without geometry) as a plain DataFrame
-                    st.session_state["last_table_df"] = result.gdf.drop(
-                        columns=["geometry"], errors="ignore"
-                    ).reset_index(drop=True)
-                    st.session_state["last_geom_types"] = result.gdf.geom_type.unique().tolist()
-
-                elif result.raw_rows:
-                    st.session_state["last_table_df"] = pd.DataFrame(result.raw_rows)
-
-                # Add to history
-                st.session_state["query_history"].append({
-                    "query": user_query,
-                    "sql": sql,
-                    "count": result.row_count,
-                })
+        if not st.session_state["last_error"] and st.session_state["pending_location_query"] is None:
+            execute_search(user_query, schema_text, table_names, device_coords=device_coords)
 
     elif run_button:
         st.warning("Please enter a query.")
+
+    pending_location_query = st.session_state.get("pending_location_query")
+    if pending_location_query:
+        request_key = f"geo_request_{st.session_state['location_request_key']}"
+        device_coords, location_error, waiting_for_location = get_device_location(
+            component_key=request_key
+        )
+
+        if not waiting_for_location:
+            if location_error:
+                st.session_state["last_error"] = location_error
+                st.session_state["device_location"] = None
+                st.session_state["pending_location_query"] = None
+                st.session_state["location_request_key"] += 1
+                st.rerun()
+
+            st.session_state["device_location"] = device_coords
+            st.session_state["pending_location_query"] = None
+            st.session_state["location_request_key"] += 1
+            execute_search(
+                pending_location_query,
+                schema_text,
+                table_names,
+                device_coords=device_coords,
+            )
+
+    if st.session_state.get("show_my_location_request"):
+        request_key = f"geo_preview_{st.session_state['location_request_key']}"
+        device_coords, location_error, waiting_for_location = get_device_location(
+            component_key=request_key
+        )
+
+        if waiting_for_location:
+            st.info("Waiting for your browser to return device location...")
+        elif location_error:
+            st.session_state["last_error"] = location_error
+            st.session_state["show_my_location_request"] = False
+            st.session_state["location_request_key"] += 1
+            st.rerun()
+        else:
+            st.session_state["device_location"] = device_coords
+            st.session_state["show_my_location_request"] = False
+            st.session_state["location_request_key"] += 1
+            if st.session_state.get("last_gdf") is not None:
+                selected_basemap = st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)")
+                st.session_state["last_map_html"] = build_map_html(
+                    st.session_state["last_gdf"],
+                    selected_basemap,
+                    device_coords=device_coords,
+                )
+                st.session_state["last_basemap"] = selected_basemap
+            else:
+                st.session_state["last_map_html"] = build_default_map_html(
+                    st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)"),
+                    device_coords=device_coords,
+                )
 
     # --- Persistent map: always visible ---
     selected_basemap = st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)")
@@ -380,7 +567,9 @@ def main():
         and st.session_state.get("last_basemap") != selected_basemap
     ):
         st.session_state["last_map_html"] = build_map_html(
-            st.session_state["last_gdf"], selected_basemap
+            st.session_state["last_gdf"],
+            selected_basemap,
+            device_coords=st.session_state.get("device_location"),
         )
         st.session_state["last_basemap"] = selected_basemap
 
@@ -399,7 +588,14 @@ def main():
             st.caption(" | ".join(legend_items))
     else:
         # Default Adelaide map -- always shown on load
-        components.html(build_default_map_html(selected_basemap), height=550, scrolling=False)
+        components.html(
+            build_default_map_html(
+                selected_basemap,
+                device_coords=st.session_state.get("device_location"),
+            ),
+            height=550,
+            scrolling=False,
+        )
 
     # --- Results info and SQL below the map ---
     if st.session_state.get("last_error"):

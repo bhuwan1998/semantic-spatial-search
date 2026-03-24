@@ -40,7 +40,7 @@ graph TB
 
     subgraph core ["Core Pipeline"]
         GEO["geocoder.py\n50+ landmarks\n+ Nominatim"]
-        LLM["llm.py\n14-rule system prompt\n8 few-shot examples"]
+        LLM["llm.py\n15-rule system prompt\n8 few-shot examples"]
         VAL["validator.py\nWhitelist tables/functions\nReject DML, auto-LIMIT"]
         EXE["executor.py\nmod_spatialite\nGPKG amphibious mode"]
         SCH["schema.py\nIntrospect GeoPackage"]
@@ -204,7 +204,10 @@ Environment variables (set in `.env` or export directly):
 - "How many restaurants are there by type?"
 - "Find parks with 'creek' in the name"
 - "Show me hospitals near the University of Adelaide"
+- "Find parks near me"
 - "Show all waterways"
+
+The map also includes a `Show My Location` control so you can compare your current position with returned features.
 
 ## Project Structure
 
@@ -239,6 +242,7 @@ graph LR
 - The LLM (Llama 3.1 8B) sometimes generates invalid SQL -- the validator catches most issues and the system retries up to 3 times.
 - Distance calculations use degree-based approximation (`ST_Distance * 111320` for meters), which is not perfectly accurate at Adelaide's latitude.
 - The geocoder covers ~50 Adelaide landmarks; uncommon places fall back to Nominatim which requires an internet connection.
+- Queries using "me", "near me", "around me", misspelled "aroud me", or "nearby" now ask for browser location access and use the device coordinates directly.
 - SpatiaLite does not support all PostGIS functions -- the system prompt guides the LLM toward compatible syntax.
 
 ## License

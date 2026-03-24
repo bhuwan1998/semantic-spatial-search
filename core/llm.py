@@ -5,13 +5,24 @@ Translates natural language queries into SpatiaLite SQL using Llama 3.1 8B,
 with schema-aware prompting, few-shot examples, and self-correction.
 """
 
-import json
 import re
 
 import ollama
 
-from core.geocoder import geocode, get_adelaide_center
+from core.geocoder import geocode
 from core.validator import SQLValidator, ValidationError
+
+
+DEVICE_LOCATION_PATTERNS = [
+    r"\bnear me\b",
+    r"\baround me\b",
+    r"\baroud me\b",
+    r"\bnearby\b",
+    r"\bclose to me\b",
+    r"\bnext to me\b",
+    r"\bby me\b",
+    r"\bfind .+\bme\b",
+]
 
 
 SYSTEM_PROMPT = """You are a SpatiaLite SQL query generator for a GeoPackage database containing OpenStreetMap data for Adelaide, South Australia.
@@ -34,12 +45,13 @@ CRITICAL RULES:
 6. ALWAYS include a LIMIT clause (default LIMIT 100 unless user specifies a number).
 7. For distance in meters, use: ST_Distance(geom, point) * 111320
 8. For "nearby" queries without a specific distance, use a 5km radius: ST_Distance(geom, point) * 111320 < 5000
-9. When user mentions a place name, I will provide coordinates. Use those coordinates with MakePoint(lng, lat, 4326).
-10. Always include AsGeoJSON(CastAutomagic(geom)) AS geojson in the SELECT list so results can be mapped.
-11. When filtering by name, use LIKE with % wildcards for partial matching and COLLATE NOCASE for case-insensitive search.
-12. Column names containing colons (like addr:street, addr:housenumber) MUST be wrapped in double quotes: "addr:street", "addr:housenumber".
-13. When users ask about features on a specific street or road, filter using "addr:street" LIKE '%street_name%' COLLATE NOCASE, or match by the name column of the relevant table.
-14. In ORDER BY clauses, ALWAYS repeat the full expression (e.g. ORDER BY ST_Distance(geom, MakePoint(...)) ASC). NEVER reference a SELECT alias like distance_meters in ORDER BY -- SQLite may not resolve it.
+9. When the user says "me", "near me", "around me", misspells it as "aroud me", or says "nearby", that refers to the user's device location. I will provide those device coordinates separately. Use ONLY those provided device coordinates with MakePoint(lng, lat, 4326). NEVER guess, geocode, or substitute another location for these phrases.
+10. When user mentions a place name, I will provide coordinates. Use those coordinates with MakePoint(lng, lat, 4326).
+11. Always include AsGeoJSON(CastAutomagic(geom)) AS geojson in the SELECT list so results can be mapped.
+12. When filtering by name, use LIKE with % wildcards for partial matching and COLLATE NOCASE for case-insensitive search.
+13. Column names containing colons (like addr:street, addr:housenumber) MUST be wrapped in double quotes: "addr:street", "addr:housenumber".
+14. When users ask about features on a specific street or road, filter using "addr:street" LIKE '%street_name%' COLLATE NOCASE, or match by the name column of the relevant table.
+15. In ORDER BY clauses, ALWAYS repeat the full expression (e.g. ORDER BY ST_Distance(geom, MakePoint(...)) ASC). NEVER reference a SELECT alias like distance_meters in ORDER BY -- SQLite may not resolve it.
 
 SCHEMA:
 {schema_context}
@@ -173,11 +185,27 @@ FEW_SHOT_EXAMPLES = [
 ]
 
 
+def query_requires_device_location(query: str) -> bool:
+    """Return True when the query refers to the user's current location."""
+    normalized_query = query.strip().lower()
+
+    if normalized_query == "me":
+        return True
+
+    return any(
+        re.search(pattern, normalized_query, re.IGNORECASE)
+        for pattern in DEVICE_LOCATION_PATTERNS
+    )
+
+
 def _resolve_location_in_query(query: str) -> tuple[str, tuple[float, float] | None]:
     """
     Try to extract and resolve a location from the user query.
     Returns the (possibly augmented) query and resolved coordinates.
     """
+    if query_requires_device_location(query):
+        return query, None
+
     coords = None
 
     # Try common patterns: "near X", "around X", "in X", "close to X", "within X of Y"
@@ -199,12 +227,17 @@ def _resolve_location_in_query(query: str) -> tuple[str, tuple[float, float] | N
     return query, coords
 
 
-def _build_location_context(coords: tuple[float, float] | None) -> str:
+def _build_location_context(
+    coords: tuple[float, float] | None,
+    *,
+    source: str = "place",
+) -> str:
     """Build a location context string for the prompt."""
     if coords:
         lat, lng = coords
+        location_label = "device location" if source == "device" else "location reference"
         return (
-            f"\nUSER LOCATION CONTEXT: The user is referring to coordinates "
+            f"\nUSER LOCATION CONTEXT: The user's {location_label} is "
             f"latitude={lat}, longitude={lng}. "
             f"Use MakePoint({lng}, {lat}, 4326) for this location in the query."
         )
@@ -215,6 +248,7 @@ def generate_sql(
     user_query: str,
     schema_context: str,
     allowed_tables: set[str],
+    device_coords: tuple[float, float] | None = None,
     model: str = "llama3.1:8b",
     max_retries: int = 3,
 ) -> tuple[str, str | None]:
@@ -226,9 +260,20 @@ def generate_sql(
     """
     validator = SQLValidator(allowed_tables)
 
+    if query_requires_device_location(user_query) and device_coords is None:
+        return "", (
+            "This query refers to your current location. "
+            "Please share your device location and try again."
+        )
+
     # Resolve location references
-    query, coords = _resolve_location_in_query(user_query)
-    location_context = _build_location_context(coords)
+    if device_coords is not None:
+        query = user_query
+        coords = device_coords
+        location_context = _build_location_context(coords, source="device")
+    else:
+        query, coords = _resolve_location_in_query(user_query)
+        location_context = _build_location_context(coords)
 
     # Build messages
     system_content = SYSTEM_PROMPT.format(schema_context=schema_context)
@@ -238,7 +283,7 @@ def generate_sql(
     messages = [
         {"role": "system", "content": system_content},
         *FEW_SHOT_EXAMPLES,
-        {"role": "user", "content": user_query},
+        {"role": "user", "content": query},
     ]
 
     last_error = None

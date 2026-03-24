@@ -7,3 +7,4 @@ ollama>=0.3
 sqlparse>=0.5
 pyogrio>=0.7
 python-dotenv>=1.0
+streamlit-js-eval>=1.0.0
