@@ -509,6 +509,10 @@ def main():
             component_key=request_key
         )
 
+        if waiting_for_location:
+            # Still waiting for the browser to return the device location; show feedback and stop.
+            st.info("Waiting for your browser to return device location...")
+            st.stop()
         if not waiting_for_location:
             if location_error:
                 st.session_state["last_error"] = location_error
