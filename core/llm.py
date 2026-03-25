@@ -21,7 +21,6 @@ DEVICE_LOCATION_PATTERNS = [
     r"\bclose to me\b",
     r"\bnext to me\b",
     r"\bby me\b",
-    r"\bfind .+\bme\b",
 ]
 
 
