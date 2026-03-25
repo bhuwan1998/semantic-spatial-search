@@ -486,7 +486,7 @@ def main():
             if waiting_for_location:
                 st.session_state["pending_location_query"] = user_query
                 st.info("Waiting for your browser to return device location...")
-                st.rerun()
+                st.stop()
             elif location_error:
                 st.session_state["last_error"] = location_error
                 st.session_state["device_location"] = None
