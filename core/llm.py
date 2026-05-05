@@ -903,6 +903,137 @@ def generate_sql(
     return "", f"Failed after {max_retries} attempts. Last error: {last_error}"
 
 
+def should_skip_analysis(result) -> bool:
+    """
+    Return True when the analysis LLM call adds no value and should be skipped.
+
+    Skipped when:
+    - Zero rows returned
+    - Pure count/aggregate result (no geometry, ≤ 3 columns, all numeric)
+    - Non-spatial result with a single scalar value (e.g. SELECT COUNT(*))
+    """
+    if result.row_count == 0:
+        return True
+
+    if not result.has_geometry and result.raw_rows:
+        # Single-row, single-column scalar (e.g. COUNT query)
+        if len(result.raw_rows) == 1 and len(result.raw_rows[0]) <= 2:
+            return True
+        # Small tabular result where every value is numeric — just show the table
+        if len(result.raw_rows) <= 5 and result.columns:
+            import numbers
+            all_numeric = all(
+                isinstance(v, (int, float, numbers.Number))
+                for row in result.raw_rows
+                for v in row.values()
+                if v is not None
+            )
+            if all_numeric:
+                return True
+
+    return False
+
+
+def generate_analysis_stream(
+    user_query: str,
+    sql: str,
+    stats: dict,
+    model: str | None = None,
+):
+    """
+    Streaming variant of generate_analysis().
+
+    Yields text chunks as they arrive from the LLM so callers can use
+    st.write_stream() for perceived latency improvement.  Falls back to
+    yielding the full string at once if the model/path doesn't support streaming.
+    """
+    analysis_model = os.getenv("ANALYSIS_MODEL", "").strip()
+    analysis_key   = os.getenv("ANALYSIS_API_KEY", "").strip()
+
+    count        = stats.get("count", 0)
+    geom_types   = stats.get("geometry_types", "unknown")
+    sample_names = stats.get("sample_names", [])
+    extra_stats  = {k: v for k, v in stats.items()
+                    if k not in ("count", "geometry_types", "sample_names")}
+
+    prompt = (
+        f"User asked: \"{user_query}\"\n"
+        f"SQL executed: {sql}\n"
+        f"Results: {count} features returned.\n"
+        f"Geometry types: {geom_types}\n"
+        f"Sample names: {', '.join(str(n) for n in sample_names[:5]) or 'N/A'}\n"
+        f"Statistics: {extra_stats}\n\n"
+        f"Provide:\n"
+        f"1. A 2-3 sentence spatial interpretation of what was found and why it matters.\n"
+        f"2. Any notable patterns, clusters, or distributions visible in the data.\n"
+        f"Be concise and factual."
+    )
+
+    if analysis_model and analysis_key:
+        try:
+            import openai
+            client = openai.OpenAI(api_key=analysis_key)
+            stream = client.chat.completions.create(
+                model=analysis_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.3,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+            return
+        except Exception:
+            pass
+
+    if analysis_model and not analysis_key:
+        use_thinking = os.getenv("ANALYSIS_THINKING", "false").lower() == "true"
+        try:
+            ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+            client = ollama.Client(host=ollama_host)
+            kwargs = dict(
+                model=analysis_model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 1.0 if use_thinking else 0.3, "num_predict": 800},
+                stream=True,
+            )
+            if use_thinking:
+                kwargs["think"] = True
+            in_thinking = True if use_thinking else False
+            for chunk in client.chat(**kwargs):
+                msg = chunk.get("message", {})
+                # While thinking tokens are flowing, suppress them from the stream
+                if use_thinking and in_thinking:
+                    if not msg.get("thinking"):
+                        in_thinking = False
+                    continue
+                text = msg.get("content", "")
+                if text:
+                    yield text
+            return
+        except Exception:
+            pass
+
+    # Fallback: local Ollama OLLAMA_MODEL, streaming
+    try:
+        local_model = model or os.getenv("OLLAMA_MODEL", "gemma4:e4b")
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        client = ollama.Client(host=ollama_host)
+        for chunk in client.chat(
+            model=local_model,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.3, "num_predict": 300},
+            stream=True,
+        ):
+            text = chunk.get("message", {}).get("content", "")
+            if text:
+                yield text
+    except Exception:
+        return
+
+
 def generate_analysis(
     user_query: str,
     sql: str,

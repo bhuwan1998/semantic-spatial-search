@@ -180,3 +180,56 @@ CREATE OR REPLACE VIEW osm_all AS
     SELECT id, osm_id, name, 'natural'     AS layer, geometry FROM osm_natural
     UNION ALL
     SELECT id, osm_id, name, 'boundaries'  AS layer, geometry FROM osm_boundaries;
+
+-- ─── Performance indexes ──────────────────────────────────────────────────────
+-- pg_trgm trigram indexes for fast ILIKE / similarity name lookups
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE INDEX IF NOT EXISTS osm_schools_name_trgm     ON osm_schools     USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS osm_hospitals_name_trgm   ON osm_hospitals   USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS osm_restaurants_name_trgm ON osm_restaurants USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS osm_pharmacies_name_trgm  ON osm_pharmacies  USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS osm_roads_name_trgm       ON osm_roads       USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS osm_waterways_name_trgm   ON osm_waterways   USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS osm_railways_name_trgm    ON osm_railways    USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS osm_parks_name_trgm       ON osm_parks       USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS osm_buildings_name_trgm   ON osm_buildings   USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS osm_landuse_name_trgm     ON osm_landuse     USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS osm_natural_name_trgm     ON osm_natural     USING GIN (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS osm_boundaries_name_trgm  ON osm_boundaries  USING GIN (name gin_trgm_ops);
+
+-- Partial GiST index on osm_boundaries admin_level for fast suburb lookups
+CREATE INDEX IF NOT EXISTS osm_boundaries_admin_geom_idx
+    ON osm_boundaries USING GIST (geometry)
+    WHERE admin_level IN ('8', '9', '10');
+
+-- Materialized view: pre-unions osm_all for fast cross-layer name lookups
+-- (refresh daily or after data reloads with: REFRESH MATERIALIZED VIEW CONCURRENTLY osm_all_mat;)
+CREATE MATERIALIZED VIEW IF NOT EXISTS osm_all_mat AS
+    SELECT id, osm_id, name, 'schools'     AS layer, geometry FROM osm_schools
+    UNION ALL
+    SELECT id, osm_id, name, 'hospitals'   AS layer, geometry FROM osm_hospitals
+    UNION ALL
+    SELECT id, osm_id, name, 'restaurants' AS layer, geometry FROM osm_restaurants
+    UNION ALL
+    SELECT id, osm_id, name, 'pharmacies'  AS layer, geometry FROM osm_pharmacies
+    UNION ALL
+    SELECT id, osm_id, name, 'roads'       AS layer, geometry FROM osm_roads
+    UNION ALL
+    SELECT id, osm_id, name, 'waterways'   AS layer, geometry FROM osm_waterways
+    UNION ALL
+    SELECT id, osm_id, name, 'railways'    AS layer, geometry FROM osm_railways
+    UNION ALL
+    SELECT id, osm_id, name, 'parks'       AS layer, geometry FROM osm_parks
+    UNION ALL
+    SELECT id, osm_id, name, 'buildings'   AS layer, geometry FROM osm_buildings
+    UNION ALL
+    SELECT id, osm_id, name, 'landuse'     AS layer, geometry FROM osm_landuse
+    UNION ALL
+    SELECT id, osm_id, name, 'natural'     AS layer, geometry FROM osm_natural
+    UNION ALL
+    SELECT id, osm_id, name, 'boundaries'  AS layer, geometry FROM osm_boundaries;
+
+CREATE UNIQUE INDEX IF NOT EXISTS osm_all_mat_id_layer_idx ON osm_all_mat (id, layer);
+CREATE INDEX        IF NOT EXISTS osm_all_mat_geom_idx     ON osm_all_mat USING GIST (geometry);
+CREATE INDEX        IF NOT EXISTS osm_all_mat_name_trgm    ON osm_all_mat USING GIN  (name gin_trgm_ops);

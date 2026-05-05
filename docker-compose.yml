@@ -12,6 +12,20 @@ services:
       POSTGRES_DB: geospatial
       POSTGRES_USER: geo
       POSTGRES_PASSWORD: geo
+    # PostgreSQL memory tuning — sized for a dedicated container with ≥4 GB RAM.
+    # shared_buffers: ~25% of container RAM; effective_cache_size: ~75%.
+    # work_mem: raised from 4 MB to 32 MB for ST_DWithin / sort / hash joins.
+    # maintenance_work_mem: speeds up VACUUM, CLUSTER, and index builds.
+    command: >
+      postgres
+        -c shared_buffers=512MB
+        -c effective_cache_size=1536MB
+        -c work_mem=32MB
+        -c maintenance_work_mem=128MB
+        -c random_page_cost=1.1
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c max_wal_size=1GB
     ports:
       - "5432:5432"
     volumes:

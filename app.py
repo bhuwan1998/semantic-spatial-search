@@ -26,7 +26,7 @@ from core.schema import introspect_db, format_schema_for_llm, get_table_names
 from core.rag import HybridRAG, retrieve_cached, prefetch, prefetch_async
 from core.llm import generate_sql, query_requires_device_location
 from core.executor import execute_query
-from core.analyst import analyse
+from core.analyst import analyse, analyse_stream
 from core.geocoder import get_adelaide_center
 from core.graph import get_graph_context_for_query, get_graph_summary, graph_is_available
 
@@ -385,8 +385,8 @@ def run_pipeline(
     if result.error:
         return {"role": "assistant", "error": result.error, "sql": sql}
 
-    # 5. Analyse results
-    analysis = analyse(user_query, sql, result)
+    # 5. Analyse results (streaming — summary rendered live in _process_query)
+    analysis = analyse_stream(user_query, sql, result)
 
     # 6. Build map HTML
     basemap = st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)")
@@ -427,7 +427,7 @@ def run_pipeline(
 
     return {
         "role":      "assistant",
-        "summary":   analysis.summary,
+        "summary":   analysis.summary,   # "" when streaming; filled by _process_query
         "stats":     analysis.stats,
         "followups": analysis.followups,
         "sql":       sql,
@@ -435,6 +435,7 @@ def run_pipeline(
         "table_df":  table_df,
         "row_count": result.row_count,
         "error":     None,
+        "_stream":   analysis.stream,    # generator or None; consumed once, then dropped
     }
 
 
@@ -536,6 +537,21 @@ def _process_query(user_query: str, all_tables, schema_text, table_names) -> Non
         result_msg = run_pipeline(
             user_query, schema_text, table_names, all_tables,
             device_coords=device_coords,
+        )
+
+    # Stream the analysis summary live if a generator is present
+    stream = result_msg.pop("_stream", None)
+    if stream is not None:
+        with st.chat_message("assistant"):
+            st.markdown(f"**{result_msg.get('row_count', 0)} result{'s' if result_msg.get('row_count', 0) != 1 else ''} found**")
+            accumulated = st.write_stream(stream)
+            result_msg["summary"] = accumulated or ""
+    elif not result_msg.get("summary"):
+        count = result_msg.get("row_count", 0)
+        result_msg["summary"] = (
+            "No features were found matching your query."
+            if count == 0
+            else f"Found {count} feature{'s' if count != 1 else ''} matching your query."
         )
 
     st.session_state["messages"].append(result_msg)

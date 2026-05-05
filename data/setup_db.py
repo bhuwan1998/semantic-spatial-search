@@ -491,6 +491,115 @@ def run_graph_build(conn: psycopg.Connection) -> None:
     print("  Graph build complete.\n")
 
 
+def run_perf_indexes(conn) -> None:
+    """
+    Apply performance indexes to the live database:
+      - pg_trgm GIN indexes on all name columns (fast ILIKE)
+      - Partial GiST index on osm_boundaries for admin_level 8/9/10
+      - Materialised view osm_all_mat with GiST + trgm indexes
+      - CLUSTER heavy geometry tables on their GiST index
+      - ANALYZE on all OSM tables
+    Safe to re-run: all statements use IF NOT EXISTS / IF EXISTS guards.
+    """
+    print("Building performance indexes...")
+
+    TABLES = [
+        "osm_schools", "osm_hospitals", "osm_restaurants", "osm_pharmacies",
+        "osm_roads", "osm_waterways", "osm_railways", "osm_parks",
+        "osm_buildings", "osm_landuse", "osm_natural", "osm_boundaries",
+    ]
+
+    with conn.cursor() as cur:
+        # pg_trgm extension
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
+
+        # GIN trigram index on name for every table
+        for tbl in TABLES:
+            idx = f"{tbl}_name_trgm"
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS {idx} ON {tbl} USING GIN (name gin_trgm_ops);"
+            )
+            print(f"  trgm index: {idx}")
+
+        # Partial GiST on osm_boundaries for suburb-level admin_level values
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS osm_boundaries_admin_geom_idx
+                ON osm_boundaries USING GIST (geometry)
+                WHERE admin_level IN ('8', '9', '10');
+        """)
+        print("  Partial GiST index on osm_boundaries (admin_level 8/9/10)")
+
+        # Materialised view osm_all_mat
+        cur.execute("""
+            CREATE MATERIALIZED VIEW IF NOT EXISTS osm_all_mat AS
+                SELECT id, osm_id, name, 'schools'     AS layer, geometry FROM osm_schools
+                UNION ALL
+                SELECT id, osm_id, name, 'hospitals'   AS layer, geometry FROM osm_hospitals
+                UNION ALL
+                SELECT id, osm_id, name, 'restaurants' AS layer, geometry FROM osm_restaurants
+                UNION ALL
+                SELECT id, osm_id, name, 'pharmacies'  AS layer, geometry FROM osm_pharmacies
+                UNION ALL
+                SELECT id, osm_id, name, 'roads'       AS layer, geometry FROM osm_roads
+                UNION ALL
+                SELECT id, osm_id, name, 'waterways'   AS layer, geometry FROM osm_waterways
+                UNION ALL
+                SELECT id, osm_id, name, 'railways'    AS layer, geometry FROM osm_railways
+                UNION ALL
+                SELECT id, osm_id, name, 'parks'       AS layer, geometry FROM osm_parks
+                UNION ALL
+                SELECT id, osm_id, name, 'buildings'   AS layer, geometry FROM osm_buildings
+                UNION ALL
+                SELECT id, osm_id, name, 'landuse'     AS layer, geometry FROM osm_landuse
+                UNION ALL
+                SELECT id, osm_id, name, 'natural'     AS layer, geometry FROM osm_natural
+                UNION ALL
+                SELECT id, osm_id, name, 'boundaries'  AS layer, geometry FROM osm_boundaries;
+        """)
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS osm_all_mat_id_layer_idx
+                ON osm_all_mat (id, layer);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS osm_all_mat_geom_idx
+                ON osm_all_mat USING GIST (geometry);
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS osm_all_mat_name_trgm
+                ON osm_all_mat USING GIN (name gin_trgm_ops);
+        """)
+        print("  Materialised view osm_all_mat + indexes")
+
+        conn.commit()
+
+    # CLUSTER heavy geometry tables on their existing GiST index
+    # (must run outside transaction; autocommit per statement)
+    old_autocommit = conn.autocommit
+    conn.autocommit = True
+    CLUSTER_TARGETS = [
+        ("osm_roads",     "osm_roads_geom_idx"),
+        ("osm_parks",     "osm_parks_geom_idx"),
+        ("osm_buildings", "osm_buildings_geom_idx"),
+        ("osm_landuse",   "osm_landuse_geom_idx"),
+    ]
+    with conn.cursor() as cur:
+        for tbl, idx in CLUSTER_TARGETS:
+            try:
+                cur.execute(f"CLUSTER {tbl} USING {idx};")
+                print(f"  CLUSTERed {tbl} on {idx}")
+            except Exception as e:
+                print(f"  CLUSTER {tbl} skipped: {e}")
+
+        # ANALYZE all OSM tables
+        for tbl in TABLES:
+            cur.execute(f"ANALYZE {tbl};")
+        cur.execute("ANALYZE osm_all_mat;")
+        print("  ANALYZE complete")
+
+    conn.autocommit = old_autocommit
+    print("Performance indexes complete.\n")
+
+
 # ─────────────────────────── main ───────────────────────────────────────────
 
 def main() -> None:
@@ -514,6 +623,7 @@ def main() -> None:
         run_data_load(conn)
 
     run_embedding_index(conn)
+    run_perf_indexes(conn)
 
     if not args.skip_graph:
         run_graph_build(conn)

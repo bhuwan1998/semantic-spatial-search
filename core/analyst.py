@@ -7,15 +7,22 @@ After a query executes, this module:
   3. Suggests 3 contextual follow-up queries
 
 Returns an AnalysisResult dataclass consumed by app.py.
+
+Streaming support
+-----------------
+analyse_stream() is a variant of analyse() that returns the AnalysisResult
+with summary="" and a separate generator `stream` attribute so app.py can
+call st.write_stream(result.stream) to render the summary token-by-token.
 """
 
 from dataclasses import dataclass, field
+from typing import Generator
 
 import geopandas as gpd
 import numpy as np
 
 from core.executor import QueryResult
-from core.llm import generate_analysis
+from core.llm import generate_analysis, generate_analysis_stream, should_skip_analysis
 
 
 @dataclass
@@ -24,6 +31,7 @@ class AnalysisResult:
     summary: str                      # 2-3 sentence LLM interpretation
     stats: dict                       # computed statistics dict
     followups: list[str] = field(default_factory=list)  # 3 suggested next queries
+    stream: Generator | None = None   # live token generator (None = already complete)
 
 
 def _compute_stats(result: QueryResult) -> dict:
@@ -119,18 +127,17 @@ def analyse(
     Run the full analysis pipeline for a query result.
 
     1. Compute stats from GeoDataFrame
-    2. Call LLM for natural-language summary
+    2. Call LLM for natural-language summary (skipped for trivial results)
     3. Generate follow-up suggestions
     """
     stats = _compute_stats(result)
 
-    # LLM summary
+    # Skip analysis LLM for zero-row, scalar, or pure-numeric results
     summary = ""
-    if result.row_count > 0:
+    if result.row_count > 0 and not should_skip_analysis(result):
         summary = generate_analysis(user_query, sql, stats)
 
     if not summary:
-        # Fallback summary if LLM unavailable
         count = result.row_count
         if count == 0:
             summary = "No features were found matching your query."
@@ -143,4 +150,47 @@ def analyse(
         summary=summary,
         stats=stats,
         followups=followups,
+    )
+
+
+def analyse_stream(
+    user_query: str,
+    sql: str,
+    result: QueryResult,
+) -> AnalysisResult:
+    """
+    Streaming variant of analyse().
+
+    Returns an AnalysisResult with summary="" and stream set to a generator
+    that yields text chunks from the LLM.  The caller should render the stream
+    with st.write_stream() and then persist the accumulated text as the summary.
+
+    For results where analysis is skipped (0 rows, pure aggregate), returns
+    normally with summary set and stream=None so the caller can skip streaming.
+    """
+    stats = _compute_stats(result)
+    followups = _generate_followups(user_query, stats)
+
+    if result.row_count == 0:
+        return AnalysisResult(
+            summary="No features were found matching your query.",
+            stats=stats,
+            followups=followups,
+            stream=None,
+        )
+
+    if should_skip_analysis(result):
+        count = result.row_count
+        return AnalysisResult(
+            summary=f"Found {count} feature{'s' if count != 1 else ''} matching your query.",
+            stats=stats,
+            followups=followups,
+            stream=None,
+        )
+
+    return AnalysisResult(
+        summary="",
+        stats=stats,
+        followups=followups,
+        stream=generate_analysis_stream(user_query, sql, stats),
     )
