@@ -23,7 +23,7 @@ import streamlit.components.v1 as components
 from streamlit_js_eval import get_geolocation
 
 from core.schema import introspect_db, format_schema_for_llm, get_table_names
-from core.rag import HybridRAG
+from core.rag import HybridRAG, retrieve_cached, prefetch, prefetch_async
 from core.llm import generate_sql, query_requires_device_location
 from core.executor import execute_query
 from core.analyst import analyse
@@ -307,10 +307,17 @@ def _init_session():
         "pending_location_query": None,
         "location_request_key":   0,
         "active_tab":             0,     # 0 = Chat, 1 = Map, 2 = Graph Explorer
+        "rag_prefetched":         False, # guard: only prefetch once per process
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+    # Warm the RAG cache for all example queries in the background so that
+    # clicking any chip is instant — the embed is already done.
+    if not st.session_state["rag_prefetched"]:
+        prefetch(EXAMPLE_QUERIES)
+        st.session_state["rag_prefetched"] = True
 
 
 # ─── core pipeline ────────────────────────────────────────────────────────────
@@ -328,11 +335,18 @@ def run_pipeline(
     so follow-up queries resolve references to prior results.
     Returns a result dict stored in messages.
     """
-    # 1. Hybrid RAG schema retrieval
-    rag = HybridRAG()
-    relevant_tables = rag.retrieve(user_query)
+    from concurrent.futures import ThreadPoolExecutor
 
     ALWAYS_INCLUDE = {"osm_all", "osm_boundaries"}
+
+    # 1. RAG + graph context concurrently — both are independent of each other.
+    #    retrieve_cached() returns instantly if the query was prefetched or seen before.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rag_future   = pool.submit(retrieve_cached, user_query)
+        graph_future = pool.submit(get_graph_context_for_query, user_query)
+
+    relevant_tables = rag_future.result()
+    graph_ctx       = graph_future.result()
 
     if relevant_tables:
         from core.schema import format_schema_for_llm as _fmt
@@ -344,15 +358,13 @@ def run_pipeline(
         rag_schema = schema_text
         rag_table_names = table_names | ALWAYS_INCLUDE
 
+    if graph_ctx:
+        rag_schema = rag_schema + f"\n\n{graph_ctx}"
+
     # 2. Build conversation history for follow-up context
     history = _build_conversation_history(
         st.session_state["messages"], CONVERSATION_HISTORY_TURNS
     )
-
-    # 2b. Append graph context to schema string (non-blocking — silent if AGE down)
-    graph_ctx = get_graph_context_for_query(user_query)
-    if graph_ctx:
-        rag_schema = rag_schema + f"\n\n{graph_ctx}"
 
     # 3. Generate SQL
     sql, error = generate_sql(
@@ -591,8 +603,24 @@ def main():
                     _render_assistant_message(msg)
 
         # Chat input
+        # A hidden text_input mirrors what the user types so we can fire
+        # prefetch_async on every keystroke — by the time they hit Enter the
+        # RAG embed is already done or in-flight.
+        def _on_input_change():
+            draft = st.session_state.get("_chat_draft", "").strip()
+            if draft:
+                prefetch_async(draft)
+
+        st.text_input(
+            "draft",
+            key="_chat_draft",
+            on_change=_on_input_change,
+            label_visibility="collapsed",
+            placeholder="Ask a spatial question...",
+        )
+
         pending    = st.session_state.pop("_pending_chat_input", None)
-        user_input = st.chat_input("Ask a spatial question...", key="chat_input_box")
+        user_input = st.chat_input("Submit query", key="chat_input_box")
         query_to_run = pending or user_input
 
         if query_to_run and query_to_run.strip():
