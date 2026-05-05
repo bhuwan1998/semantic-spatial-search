@@ -1,15 +1,20 @@
 """
-LLM Integration Module - Ollama-powered natural language to SpatiaLite SQL.
+LLM Integration Module - Ollama-powered natural language to PostGIS SQL.
 
-Translates natural language queries into SpatiaLite SQL using Llama 3.1 8B,
-with schema-aware prompting, few-shot examples, and self-correction.
+Translates natural language queries into PostGIS SQL using a local Ollama model,
+with schema-aware prompting (Hybrid RAG), few-shot examples, and self-correction.
+
+DESIGN PRINCIPLE: All place name resolution happens INSIDE PostGIS via subqueries
+against osm_boundaries and osm_all. No geocoder, no hardcoded coordinates, no
+Nominatim calls at runtime. The only coordinates injected into the prompt are
+device GPS coordinates (genuinely from the browser, cannot be resolved another way).
 """
 
+import os
 import re
 
 import ollama
 
-from core.geocoder import geocode
 from core.validator import SQLValidator, ValidationError
 
 
@@ -24,41 +29,83 @@ DEVICE_LOCATION_PATTERNS = [
 ]
 
 
-SYSTEM_PROMPT = """You are a SpatiaLite SQL query generator for a GeoPackage database containing OpenStreetMap data for Adelaide, South Australia.
+SYSTEM_PROMPT = """You are a PostGIS SQL query generator for a PostgreSQL database containing OpenStreetMap data for Adelaide, South Australia.
 
 CRITICAL RULES:
-1. Output ONLY a valid SpatiaLite SELECT query. No markdown, no explanation, no backticks, no commentary.
+1. Output ONLY a valid PostGIS SELECT query. No markdown, no explanation, no backticks, no commentary.
 2. Use ONLY the tables and columns listed in the SCHEMA below.
-3. All geometry columns are named "geom" and use SRID 4326 (WGS84 longitude/latitude).
-4. Use SpatiaLite syntax, NOT PostGIS:
-   - Use MakePoint(longitude, latitude, 4326) to create points (NOTE: longitude first, latitude second)
-   - There is NO ST_DWithin function. Use: ST_Distance(a, b) < threshold
-   - There is NO <-> operator. Use: ORDER BY ST_Distance(geom, point) ASC LIMIT N
-   - Use ST_Distance(geom, point) for distance (returns degrees; multiply by 111320 for approximate meters)
-   - For geometry output, ALWAYS use AsGeoJSON(CastAutomagic(geom)) - this is required for GeoPackage databases
-   - Use ST_Area(geom) for area, ST_Length(geom) for length
-   - Use ST_Buffer(geom, radius_in_degrees) for buffers
-   - Use ST_Contains(polygon, point) to test containment
-   - Use ST_Intersects(a, b) for intersection tests
-5. NEVER generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, ATTACH, or PRAGMA statements.
+3. All geometry columns are named "geometry" and use SRID 4326 (WGS84 longitude/latitude).
+4. Use PostGIS syntax:
+   - ST_SetSRID(ST_MakePoint(longitude, latitude), 4326) to create points from known coords
+   - ST_DWithin(a::geography, b::geography, distance_m) for proximity filters (uses spatial index)
+   - ST_Distance(a::geography, b::geography) returns metres directly
+   - ORDER BY geometry <-> point_expr LIMIT N for nearest-neighbour sort
+   - ST_AsGeoJSON(geometry) AS geojson — ALWAYS include this in SELECT so results can be mapped
+     Even for count/comparison queries, use UNION ALL to return the actual geometries alongside counts
+   - ST_Area(geometry::geography) for area in square metres
+   - ST_Length(geometry::geography) for length in metres
+   - ILIKE '%term%' for case-insensitive name filtering
+5. NEVER generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, COPY, or EXECUTE statements.
 6. ALWAYS include a LIMIT clause (default LIMIT 100 unless user specifies a number).
-7. For distance in meters, use: ST_Distance(geom, point) * 111320
-8. For "nearby" queries without a specific distance, use a 5km radius: ST_Distance(geom, point) * 111320 < 5000
-9. When the user says "me", "near me", "around me", misspells it as "aroud me", or says "nearby", that refers to the user's device location. I will provide those device coordinates separately. Use ONLY those provided device coordinates with MakePoint(lng, lat, 4326). NEVER guess, geocode, or substitute another location for these phrases.
-10. When user mentions a place name, I will provide coordinates. Use those coordinates with MakePoint(lng, lat, 4326).
-11. Always include AsGeoJSON(CastAutomagic(geom)) AS geojson in the SELECT list so results can be mapped.
-12. When filtering by name, use LIKE with % wildcards for partial matching and COLLATE NOCASE for case-insensitive search.
-13. Column names containing colons (like addr:street, addr:housenumber) MUST be wrapped in double quotes: "addr:street", "addr:housenumber".
-14. When users ask about features on a specific street or road, filter using "addr:street" LIKE '%street_name%' COLLATE NOCASE, or match by the name column of the relevant table.
-15. In ORDER BY clauses, ALWAYS repeat the full expression (e.g. ORDER BY ST_Distance(geom, MakePoint(...)) ASC). NEVER reference a SELECT alias like distance_meters in ORDER BY -- SQLite may not resolve it.
+7. NEVER invent table names. The ONLY tables that exist are the osm_* tables listed in SCHEMA below.
+   Do NOT use tables named: boundary, suburb, area, place, location, region, feature, layer, or any
+   other name not prefixed with osm_. For suburb/boundary geometry always use osm_boundaries.
+8. When using CTEs (WITH ... AS), you may reference the CTE name inside the main SELECT/FROM — that
+   is fine. But NEVER use a bare word like "boundary" or "suburb" as a FROM target unless it is
+   defined as a CTE in the same query.
+
+PLACE NAME RESOLUTION — THIS IS THE MOST IMPORTANT RULE:
+- NEVER hardcode latitude/longitude values for named places (suburbs, landmarks, beaches, parks, etc.)
+- ALL place names must be resolved at query time using a PostGIS subquery against the database:
+    (SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%place name%' LIMIT 1)
+  or for suburb/boundary lookups:
+    (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%suburb name%' LIMIT 1)
+- The only exception is when I explicitly provide device GPS coordinates in the prompt below.
+  In that case, use ST_SetSRID(ST_MakePoint(lng, lat), 4326) with the exact provided values.
+
+DISTANCE PATTERN FOR NAMED PLACES:
+    WHERE ST_DWithin(
+        f.geometry::geography,
+        (SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%place%' LIMIT 1)::geography,
+        distance_m
+    )
+    ORDER BY f.geometry <-> (SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%place%' LIMIT 1)
+    LIMIT N
+
+CONTAINMENT PATTERN (features inside a suburb):
+    -- Always use ORDER BY admin_level DESC to prefer the suburb polygon over larger council/region boundaries
+    WHERE ST_Within(
+        f.geometry,
+        (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%suburb%' ORDER BY admin_level DESC LIMIT 1)
+    )
+
+COMPARISON PATTERN (count two feature types in the same suburb — geometry rows first so the map renders, count rows at end):
+    SELECT 'cafe' AS feature_type, NULL AS count, ST_AsGeoJSON(geometry) AS geojson
+    FROM osm_restaurants
+    WHERE amenity = 'cafe'
+      AND ST_Within(geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%suburb%' ORDER BY admin_level DESC LIMIT 1))
+    UNION ALL
+    SELECT 'park' AS feature_type, NULL AS count, ST_AsGeoJSON(geometry) AS geojson
+    FROM osm_parks
+    WHERE ST_Within(geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%suburb%' ORDER BY admin_level DESC LIMIT 1))
+    UNION ALL
+    SELECT 'cafes_total' AS feature_type, COUNT(*) AS count, NULL::text AS geojson
+    FROM osm_restaurants
+    WHERE amenity = 'cafe'
+      AND ST_Within(geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%suburb%' ORDER BY admin_level DESC LIMIT 1))
+    UNION ALL
+    SELECT 'parks_total' AS feature_type, COUNT(*) AS count, NULL::text AS geojson
+    FROM osm_parks
+    WHERE ST_Within(geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%suburb%' ORDER BY admin_level DESC LIMIT 1))
+    LIMIT 200;
 
 SCHEMA:
 {schema_context}
 """
 
-# Few-shot examples tuned for SpatiaLite syntax and Adelaide context
+
 FEW_SHOT_EXAMPLES = [
-    # Pattern 1: Find N nearest points
+    # Pattern 1: Nearest N — place resolved via osm_all subquery
     {
         "role": "user",
         "content": "Find 5 schools near Adelaide CBD"
@@ -66,15 +113,17 @@ FEW_SHOT_EXAMPLES = [
     {
         "role": "assistant",
         "content": (
-            "SELECT name, ST_Distance(geom, MakePoint(138.6007, -34.9285, 4326)) * 111320 AS distance_meters, "
-            "AsGeoJSON(CastAutomagic(geom)) AS geojson "
-            "FROM schools "
-            "WHERE name IS NOT NULL "
-            "ORDER BY ST_Distance(geom, MakePoint(138.6007, -34.9285, 4326)) ASC "
+            "SELECT s.name, "
+            "ROUND(ST_Distance(s.geometry::geography, "
+            "(SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%Adelaide CBD%' LIMIT 1)::geography)) AS distance_meters, "
+            "ST_AsGeoJSON(s.geometry) AS geojson "
+            "FROM osm_schools s "
+            "WHERE s.name IS NOT NULL "
+            "ORDER BY s.geometry <-> (SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%Adelaide CBD%' LIMIT 1) "
             "LIMIT 5;"
         )
     },
-    # Pattern 2: Proximity / radius search
+    # Pattern 2: Radius search — place resolved via osm_all subquery
     {
         "role": "user",
         "content": "Show me restaurants within 2km of Glenelg Beach"
@@ -82,15 +131,37 @@ FEW_SHOT_EXAMPLES = [
     {
         "role": "assistant",
         "content": (
-            "SELECT name, amenity, ST_Distance(geom, MakePoint(138.5149, -34.9818, 4326)) * 111320 AS distance_meters, "
-            "AsGeoJSON(CastAutomagic(geom)) AS geojson "
-            "FROM restaurants "
-            "WHERE ST_Distance(geom, MakePoint(138.5149, -34.9818, 4326)) * 111320 < 2000 "
-            "ORDER BY ST_Distance(geom, MakePoint(138.5149, -34.9818, 4326)) ASC "
+            "SELECT r.name, r.amenity, r.cuisine, "
+            "ROUND(ST_Distance(r.geometry::geography, "
+            "(SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%Glenelg%' LIMIT 1)::geography)) AS distance_meters, "
+            "ST_AsGeoJSON(r.geometry) AS geojson "
+            "FROM osm_restaurants r "
+            "WHERE ST_DWithin("
+            "r.geometry::geography, "
+            "(SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%Glenelg%' LIMIT 1)::geography, "
+            "2000) "
+            "ORDER BY r.geometry <-> (SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%Glenelg%' LIMIT 1) "
             "LIMIT 100;"
         )
     },
-    # Pattern 3: Attribute filter on linestrings
+    # Pattern 3: Features inside a suburb — osm_boundaries subquery
+    {
+        "role": "user",
+        "content": "Show all pharmacies in Norwood"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT p.name, p.amenity, ST_AsGeoJSON(p.geometry) AS geojson "
+            "FROM osm_pharmacies p "
+            "WHERE ST_Within("
+            "p.geometry, "
+            "(SELECT geometry FROM osm_boundaries WHERE name ILIKE '%Norwood%' ORDER BY admin_level DESC LIMIT 1)"
+            ") "
+            "LIMIT 100;"
+        )
+    },
+    # Pattern 4: Attribute filter on linestrings
     {
         "role": "user",
         "content": "Show all primary roads"
@@ -98,13 +169,13 @@ FEW_SHOT_EXAMPLES = [
     {
         "role": "assistant",
         "content": (
-            "SELECT name, highway, AsGeoJSON(CastAutomagic(geom)) AS geojson "
-            "FROM roads "
+            "SELECT name, highway, ST_AsGeoJSON(geometry) AS geojson "
+            "FROM osm_roads "
             "WHERE highway = 'primary' AND name IS NOT NULL "
             "LIMIT 100;"
         )
     },
-    # Pattern 4: Polygon area calculation
+    # Pattern 5: Polygon area calculation
     {
         "role": "user",
         "content": "What are the largest parks by area?"
@@ -112,15 +183,16 @@ FEW_SHOT_EXAMPLES = [
     {
         "role": "assistant",
         "content": (
-            "SELECT name, leisure, ST_Area(geom) * 12365000000 AS area_sq_meters, "
-            "AsGeoJSON(CastAutomagic(geom)) AS geojson "
-            "FROM parks "
+            "SELECT name, leisure, "
+            "ROUND(ST_Area(geometry::geography)) AS area_sq_meters, "
+            "ST_AsGeoJSON(geometry) AS geojson "
+            "FROM osm_parks "
             "WHERE name IS NOT NULL "
-            "ORDER BY ST_Area(geom) DESC "
+            "ORDER BY ST_Area(geometry::geography) DESC "
             "LIMIT 20;"
         )
     },
-    # Pattern 5: Intersection between layers
+    # Pattern 6: Cross-layer intersection
     {
         "role": "user",
         "content": "Which roads intersect parks?"
@@ -129,14 +201,14 @@ FEW_SHOT_EXAMPLES = [
         "role": "assistant",
         "content": (
             "SELECT r.name AS road_name, r.highway, p.name AS park_name, "
-            "AsGeoJSON(CastAutomagic(r.geom)) AS geojson "
-            "FROM roads r, parks p "
-            "WHERE ST_Intersects(r.geom, p.geom) "
-            "AND r.name IS NOT NULL AND p.name IS NOT NULL "
+            "ST_AsGeoJSON(r.geometry) AS geojson "
+            "FROM osm_roads r "
+            "JOIN osm_parks p ON ST_Intersects(r.geometry, p.geometry) "
+            "WHERE r.name IS NOT NULL AND p.name IS NOT NULL "
             "LIMIT 50;"
         )
     },
-    # Pattern 6: Count / aggregate
+    # Pattern 7: Count / aggregate
     {
         "role": "user",
         "content": "How many restaurants are there by type?"
@@ -145,13 +217,13 @@ FEW_SHOT_EXAMPLES = [
         "role": "assistant",
         "content": (
             "SELECT amenity, COUNT(*) AS count "
-            "FROM restaurants "
+            "FROM osm_restaurants "
             "GROUP BY amenity "
             "ORDER BY count DESC "
             "LIMIT 20;"
         )
     },
-    # Pattern 7: Search by name
+    # Pattern 8: Name search
     {
         "role": "user",
         "content": "Find parks with 'creek' in the name"
@@ -159,26 +231,551 @@ FEW_SHOT_EXAMPLES = [
     {
         "role": "assistant",
         "content": (
-            "SELECT name, leisure, AsGeoJSON(CastAutomagic(geom)) AS geojson "
-            "FROM parks "
-            "WHERE name LIKE '%creek%' COLLATE NOCASE "
+            "SELECT name, leisure, ST_AsGeoJSON(geometry) AS geojson "
+            "FROM osm_parks "
+            "WHERE name ILIKE '%creek%' "
             "LIMIT 50;"
         )
     },
-    # Pattern 8: Buffer / containment
+    # Pattern 9: Near me — device GPS injected by app
     {
         "role": "user",
-        "content": "Show me hospitals within 3km of the University of Adelaide"
+        "content": "Find hospitals near me"
     },
     {
         "role": "assistant",
         "content": (
-            "SELECT name, ST_Distance(geom, MakePoint(138.6040, -34.9200, 4326)) * 111320 AS distance_meters, "
-            "AsGeoJSON(CastAutomagic(geom)) AS geojson "
-            "FROM hospitals "
-            "WHERE ST_Distance(geom, MakePoint(138.6040, -34.9200, 4326)) * 111320 < 3000 "
-            "ORDER BY ST_Distance(geom, MakePoint(138.6040, -34.9200, 4326)) ASC "
+            "SELECT name, "
+            "ROUND(ST_Distance(geometry::geography, ST_SetSRID(ST_MakePoint({lng}, {lat}), 4326)::geography)) AS distance_meters, "
+            "ST_AsGeoJSON(geometry) AS geojson "
+            "FROM osm_hospitals "
+            "WHERE ST_DWithin(geometry::geography, ST_SetSRID(ST_MakePoint({lng}, {lat}), 4326)::geography, 5000) "
+            "ORDER BY geometry <-> ST_SetSRID(ST_MakePoint({lng}, {lat}), 4326) "
+            "LIMIT 20;"
+        )
+    },
+    # Pattern 10: Compare two feature types inside a suburb — UNION ALL with geometries for mapping
+    {
+        "role": "user",
+        "content": "How many cafes are there in Unley compared to parks"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT 'cafe' AS feature_type, NULL AS count, ST_AsGeoJSON(geometry) AS geojson "
+            "FROM osm_restaurants "
+            "WHERE amenity = 'cafe' "
+            "AND ST_Within(geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%Unley%' ORDER BY admin_level DESC LIMIT 1)) "
+            "UNION ALL "
+            "SELECT 'park' AS feature_type, NULL AS count, ST_AsGeoJSON(geometry) AS geojson "
+            "FROM osm_parks "
+            "WHERE ST_Within(geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%Unley%' ORDER BY admin_level DESC LIMIT 1)) "
+            "UNION ALL "
+            "SELECT 'cafes_total' AS feature_type, COUNT(*) AS count, NULL::text AS geojson "
+            "FROM osm_restaurants "
+            "WHERE amenity = 'cafe' "
+            "AND ST_Within(geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%Unley%' ORDER BY admin_level DESC LIMIT 1)) "
+            "UNION ALL "
+            "SELECT 'parks_total' AS feature_type, COUNT(*) AS count, NULL::text AS geojson "
+            "FROM osm_parks "
+            "WHERE ST_Within(geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%Unley%' ORDER BY admin_level DESC LIMIT 1)) "
+            "LIMIT 200;"
+        )
+    },
+    # Pattern 11: Radius from a named landmark resolved via DB
+    {
+        "role": "user",
+        "content": "Show me schools within 3km of the University of Adelaide"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT s.name, "
+            "ROUND(ST_Distance(s.geometry::geography, "
+            "(SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%University of Adelaide%' LIMIT 1)::geography)) AS distance_meters, "
+            "ST_AsGeoJSON(s.geometry) AS geojson "
+            "FROM osm_schools s "
+            "WHERE ST_DWithin("
+            "s.geometry::geography, "
+            "(SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%University of Adelaide%' LIMIT 1)::geography, "
+            "3000) "
+            "ORDER BY s.geometry <-> (SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%University of Adelaide%' LIMIT 1) "
             "LIMIT 100;"
+        )
+    },
+    # Pattern 12: Restaurant density per suburb — normalised by area (km²)
+    {
+        "role": "user",
+        "content": "Which suburbs have the most restaurants per square kilometre?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT b.name AS suburb, "
+            "COUNT(r.id) AS restaurant_count, "
+            "ROUND(ST_Area(b.geometry::geography)::numeric / 1000000, 4) AS area_km2, "
+            "ROUND((COUNT(r.id) / (ST_Area(b.geometry::geography) / 1000000))::numeric, 2) AS restaurants_per_km2, "
+            "ST_AsGeoJSON(b.geometry) AS geojson "
+            "FROM osm_boundaries b "
+            "LEFT JOIN osm_restaurants r ON ST_Within(r.geometry, b.geometry) "
+            "WHERE b.admin_level = '9' "
+            "GROUP BY b.id, b.name, b.geometry "
+            "HAVING COUNT(r.id) > 0 "
+            "ORDER BY restaurants_per_km2 DESC "
+            "LIMIT 20;"
+        )
+    },
+    # Pattern 13: Multi-type count in one suburb — schools, hospitals, pharmacies
+    {
+        "role": "user",
+        "content": "How many schools, hospitals and pharmacies are in Norwood?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT 'school' AS feature_type, NULL AS count, ST_AsGeoJSON(s.geometry) AS geojson "
+            "FROM osm_schools s "
+            "WHERE ST_Within(s.geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%Norwood%' ORDER BY admin_level DESC LIMIT 1)) "
+            "UNION ALL "
+            "SELECT 'hospital' AS feature_type, NULL AS count, ST_AsGeoJSON(h.geometry) AS geojson "
+            "FROM osm_hospitals h "
+            "WHERE ST_Within(h.geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%Norwood%' ORDER BY admin_level DESC LIMIT 1)) "
+            "UNION ALL "
+            "SELECT 'pharmacy' AS feature_type, NULL AS count, ST_AsGeoJSON(p.geometry) AS geojson "
+            "FROM osm_pharmacies p "
+            "WHERE ST_Within(p.geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%Norwood%' ORDER BY admin_level DESC LIMIT 1)) "
+            "UNION ALL "
+            "SELECT 'schools_total' AS feature_type, COUNT(*) AS count, NULL::text AS geojson "
+            "FROM osm_schools "
+            "WHERE ST_Within(geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%Norwood%' ORDER BY admin_level DESC LIMIT 1)) "
+            "UNION ALL "
+            "SELECT 'hospitals_total' AS feature_type, COUNT(*) AS count, NULL::text AS geojson "
+            "FROM osm_hospitals "
+            "WHERE ST_Within(geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%Norwood%' ORDER BY admin_level DESC LIMIT 1)) "
+            "UNION ALL "
+            "SELECT 'pharmacies_total' AS feature_type, COUNT(*) AS count, NULL::text AS geojson "
+            "FROM osm_pharmacies "
+            "WHERE ST_Within(geometry, (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%Norwood%' ORDER BY admin_level DESC LIMIT 1)) "
+            "LIMIT 200;"
+        )
+    },
+    # Pattern 14: Hospitals with no pharmacy within 1km — NOT EXISTS proximity gap
+    {
+        "role": "user",
+        "content": "Which hospitals have no pharmacy within 1km?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT h.name, ST_AsGeoJSON(h.geometry) AS geojson "
+            "FROM osm_hospitals h "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM osm_pharmacies p "
+            "WHERE ST_DWithin(h.geometry::geography, p.geometry::geography, 1000)"
+            ") "
+            "AND h.name IS NOT NULL "
+            "ORDER BY h.name "
+            "LIMIT 50;"
+        )
+    },
+    # Pattern 15: Landuse types inside a suburb
+    {
+        "role": "user",
+        "content": "What landuse types are present in Glenelg?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT l.landuse, COUNT(*) AS count, "
+            "ROUND(SUM(ST_Area(ST_Intersection(l.geometry, b.geometry)::geography))::numeric, 0) AS total_area_m2, "
+            "ST_AsGeoJSON(l.geometry) AS geojson "
+            "FROM osm_landuse l "
+            "JOIN osm_boundaries b ON ST_Intersects(l.geometry, b.geometry) "
+            "WHERE b.name ILIKE '%Glenelg%' AND b.admin_level = '9' "
+            "GROUP BY l.landuse, l.geometry "
+            "ORDER BY total_area_m2 DESC "
+            "LIMIT 100;"
+        )
+    },
+    # Pattern 16: Most isolated schools — largest minimum distance to any other school
+    {
+        "role": "user",
+        "content": "Which schools are most isolated — furthest from any other school?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT a.name, "
+            "ROUND(MIN(ST_Distance(a.geometry::geography, b.geometry::geography))::numeric) AS nearest_school_m, "
+            "ST_AsGeoJSON(a.geometry) AS geojson "
+            "FROM osm_schools a "
+            "JOIN osm_schools b ON a.id <> b.id "
+            "WHERE a.name IS NOT NULL "
+            "GROUP BY a.id, a.name, a.geometry "
+            "ORDER BY nearest_school_m DESC "
+            "LIMIT 20;"
+        )
+    },
+    # Pattern 17: Largest residential landuse areas
+    {
+        "role": "user",
+        "content": "What are the 10 largest residential landuse areas?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT name, landuse, "
+            "ROUND(ST_Area(geometry::geography)::numeric) AS area_m2, "
+            "ST_AsGeoJSON(geometry) AS geojson "
+            "FROM osm_landuse "
+            "WHERE landuse = 'residential' "
+            "ORDER BY ST_Area(geometry::geography) DESC "
+            "LIMIT 10;"
+        )
+    },
+    # Pattern 18a-d: Green vs concrete ratio — multiple phrasing variants, same SQL
+    # Returns clipped park polygons (green) and building polygons (concrete) for mapping
+    # plus summary stat rows so metric cards appear. Uses UNION ALL pattern.
+    {
+        "role": "user",
+        "content": "What is the ratio of green space to building coverage in the Adelaide CBD?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "WITH suburb AS ( "
+            "SELECT geometry FROM osm_boundaries "
+            "WHERE name ILIKE '%Adelaide%' AND admin_level = '9' ORDER BY admin_level DESC LIMIT 1 "
+            "), "
+            "stats AS ( "
+            "SELECT "
+            "ST_Area((SELECT geometry FROM suburb)::geography) AS total_m2, "
+            "COALESCE(SUM(CASE WHEN src='park' THEN area ELSE 0 END), 0) AS green_m2, "
+            "COALESCE(SUM(CASE WHEN src='building' THEN area ELSE 0 END), 0) AS concrete_m2 "
+            "FROM ("
+            "SELECT 'park' AS src, ST_Area(ST_Intersection(p.geometry, s.geometry)::geography) AS area "
+            "FROM osm_parks p, suburb s WHERE ST_Intersects(p.geometry, s.geometry) "
+            "AND ST_GeometryType(p.geometry) IN ('ST_Polygon','ST_MultiPolygon') "
+            "UNION ALL "
+            "SELECT 'building' AS src, ST_Area(ST_Intersection(b.geometry, s.geometry)::geography) AS area "
+            "FROM osm_buildings b, suburb s WHERE ST_Intersects(b.geometry, s.geometry)"
+            ") areas "
+            ") "
+            "SELECT 'park' AS feature_type, NULL::numeric AS count, "
+            "p.name, "
+            "ROUND(ST_Area(ST_Intersection(p.geometry, s.geometry)::geography)::numeric) AS area_m2, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS green_to_concrete_ratio, "
+            "ROUND((100.0 * st.green_m2 / st.total_m2)::numeric, 2) AS green_pct, "
+            "ROUND((100.0 * st.concrete_m2 / st.total_m2)::numeric, 2) AS building_pct, "
+            "ST_AsGeoJSON(ST_Intersection(p.geometry, s.geometry)) AS geojson "
+            "FROM osm_parks p, suburb s, stats st "
+            "WHERE ST_Intersects(p.geometry, s.geometry) "
+            "AND ST_GeometryType(p.geometry) IN ('ST_Polygon','ST_MultiPolygon') "
+            "UNION ALL "
+            "SELECT 'building' AS feature_type, NULL::numeric AS count, "
+            "b.name, "
+            "ROUND(ST_Area(ST_Intersection(b.geometry, s.geometry)::geography)::numeric) AS area_m2, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS green_to_concrete_ratio, "
+            "ROUND((100.0 * st.green_m2 / st.total_m2)::numeric, 2) AS green_pct, "
+            "ROUND((100.0 * st.concrete_m2 / st.total_m2)::numeric, 2) AS building_pct, "
+            "ST_AsGeoJSON(ST_Intersection(b.geometry, s.geometry)) AS geojson "
+            "FROM osm_buildings b, suburb s, stats st "
+            "WHERE ST_Intersects(b.geometry, s.geometry) "
+            "UNION ALL "
+            "SELECT 'green_area_m2' AS feature_type, ROUND(st.green_m2::numeric) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson "
+            "FROM stats st "
+            "UNION ALL "
+            "SELECT 'building_area_m2' AS feature_type, ROUND(st.concrete_m2::numeric) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson "
+            "FROM stats st "
+            "UNION ALL "
+            "SELECT 'green_to_concrete_ratio' AS feature_type, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson "
+            "FROM stats st "
+            "LIMIT 500;"
+        )
+    },
+    {
+        "role": "user",
+        "content": "Find the ratio of buildings to green spaces in Adelaide CBD"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "WITH suburb AS ( "
+            "SELECT geometry FROM osm_boundaries "
+            "WHERE name ILIKE '%Adelaide%' AND admin_level = '9' ORDER BY admin_level DESC LIMIT 1 "
+            "), "
+            "stats AS ( "
+            "SELECT "
+            "ST_Area((SELECT geometry FROM suburb)::geography) AS total_m2, "
+            "COALESCE(SUM(CASE WHEN src='park' THEN area ELSE 0 END), 0) AS green_m2, "
+            "COALESCE(SUM(CASE WHEN src='building' THEN area ELSE 0 END), 0) AS concrete_m2 "
+            "FROM ("
+            "SELECT 'park' AS src, ST_Area(ST_Intersection(p.geometry, s.geometry)::geography) AS area "
+            "FROM osm_parks p, suburb s WHERE ST_Intersects(p.geometry, s.geometry) "
+            "AND ST_GeometryType(p.geometry) IN ('ST_Polygon','ST_MultiPolygon') "
+            "UNION ALL "
+            "SELECT 'building' AS src, ST_Area(ST_Intersection(b.geometry, s.geometry)::geography) AS area "
+            "FROM osm_buildings b, suburb s WHERE ST_Intersects(b.geometry, s.geometry)"
+            ") areas "
+            ") "
+            "SELECT 'park' AS feature_type, NULL::numeric AS count, "
+            "p.name, "
+            "ROUND(ST_Area(ST_Intersection(p.geometry, s.geometry)::geography)::numeric) AS area_m2, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS green_to_concrete_ratio, "
+            "ROUND((100.0 * st.green_m2 / st.total_m2)::numeric, 2) AS green_pct, "
+            "ROUND((100.0 * st.concrete_m2 / st.total_m2)::numeric, 2) AS building_pct, "
+            "ST_AsGeoJSON(ST_Intersection(p.geometry, s.geometry)) AS geojson "
+            "FROM osm_parks p, suburb s, stats st "
+            "WHERE ST_Intersects(p.geometry, s.geometry) "
+            "AND ST_GeometryType(p.geometry) IN ('ST_Polygon','ST_MultiPolygon') "
+            "UNION ALL "
+            "SELECT 'building' AS feature_type, NULL::numeric AS count, "
+            "b.name, "
+            "ROUND(ST_Area(ST_Intersection(b.geometry, s.geometry)::geography)::numeric) AS area_m2, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS green_to_concrete_ratio, "
+            "ROUND((100.0 * st.green_m2 / st.total_m2)::numeric, 2) AS green_pct, "
+            "ROUND((100.0 * st.concrete_m2 / st.total_m2)::numeric, 2) AS building_pct, "
+            "ST_AsGeoJSON(ST_Intersection(b.geometry, s.geometry)) AS geojson "
+            "FROM osm_buildings b, suburb s, stats st "
+            "WHERE ST_Intersects(b.geometry, s.geometry) "
+            "UNION ALL "
+            "SELECT 'green_area_m2' AS feature_type, ROUND(st.green_m2::numeric) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson FROM stats st "
+            "UNION ALL "
+            "SELECT 'building_area_m2' AS feature_type, ROUND(st.concrete_m2::numeric) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson FROM stats st "
+            "UNION ALL "
+            "SELECT 'green_to_concrete_ratio' AS feature_type, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson FROM stats st "
+            "LIMIT 500;"
+        )
+    },
+    {
+        "role": "user",
+        "content": "Compare green areas vs buildings in the Adelaide CBD"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "WITH suburb AS ( "
+            "SELECT geometry FROM osm_boundaries "
+            "WHERE name ILIKE '%Adelaide%' AND admin_level = '9' ORDER BY admin_level DESC LIMIT 1 "
+            "), "
+            "stats AS ( "
+            "SELECT "
+            "ST_Area((SELECT geometry FROM suburb)::geography) AS total_m2, "
+            "COALESCE(SUM(CASE WHEN src='park' THEN area ELSE 0 END), 0) AS green_m2, "
+            "COALESCE(SUM(CASE WHEN src='building' THEN area ELSE 0 END), 0) AS concrete_m2 "
+            "FROM ("
+            "SELECT 'park' AS src, ST_Area(ST_Intersection(p.geometry, s.geometry)::geography) AS area "
+            "FROM osm_parks p, suburb s WHERE ST_Intersects(p.geometry, s.geometry) "
+            "AND ST_GeometryType(p.geometry) IN ('ST_Polygon','ST_MultiPolygon') "
+            "UNION ALL "
+            "SELECT 'building' AS src, ST_Area(ST_Intersection(b.geometry, s.geometry)::geography) AS area "
+            "FROM osm_buildings b, suburb s WHERE ST_Intersects(b.geometry, s.geometry)"
+            ") areas "
+            ") "
+            "SELECT 'park' AS feature_type, NULL::numeric AS count, "
+            "p.name, "
+            "ROUND(ST_Area(ST_Intersection(p.geometry, s.geometry)::geography)::numeric) AS area_m2, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS green_to_concrete_ratio, "
+            "ROUND((100.0 * st.green_m2 / st.total_m2)::numeric, 2) AS green_pct, "
+            "ROUND((100.0 * st.concrete_m2 / st.total_m2)::numeric, 2) AS building_pct, "
+            "ST_AsGeoJSON(ST_Intersection(p.geometry, s.geometry)) AS geojson "
+            "FROM osm_parks p, suburb s, stats st "
+            "WHERE ST_Intersects(p.geometry, s.geometry) "
+            "AND ST_GeometryType(p.geometry) IN ('ST_Polygon','ST_MultiPolygon') "
+            "UNION ALL "
+            "SELECT 'building' AS feature_type, NULL::numeric AS count, "
+            "b.name, "
+            "ROUND(ST_Area(ST_Intersection(b.geometry, s.geometry)::geography)::numeric) AS area_m2, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS green_to_concrete_ratio, "
+            "ROUND((100.0 * st.green_m2 / st.total_m2)::numeric, 2) AS green_pct, "
+            "ROUND((100.0 * st.concrete_m2 / st.total_m2)::numeric, 2) AS building_pct, "
+            "ST_AsGeoJSON(ST_Intersection(b.geometry, s.geometry)) AS geojson "
+            "FROM osm_buildings b, suburb s, stats st "
+            "WHERE ST_Intersects(b.geometry, s.geometry) "
+            "UNION ALL "
+            "SELECT 'green_area_m2' AS feature_type, ROUND(st.green_m2::numeric) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson FROM stats st "
+            "UNION ALL "
+            "SELECT 'building_area_m2' AS feature_type, ROUND(st.concrete_m2::numeric) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson FROM stats st "
+            "UNION ALL "
+            "SELECT 'green_to_concrete_ratio' AS feature_type, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson FROM stats st "
+            "LIMIT 500;"
+        )
+    },
+    {
+        "role": "user",
+        "content": "How much of Unley is parks vs buildings?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "WITH suburb AS ( "
+            "SELECT geometry FROM osm_boundaries "
+            "WHERE name ILIKE '%Unley%' AND admin_level = '9' ORDER BY admin_level DESC LIMIT 1 "
+            "), "
+            "stats AS ( "
+            "SELECT "
+            "ST_Area((SELECT geometry FROM suburb)::geography) AS total_m2, "
+            "COALESCE(SUM(CASE WHEN src='park' THEN area ELSE 0 END), 0) AS green_m2, "
+            "COALESCE(SUM(CASE WHEN src='building' THEN area ELSE 0 END), 0) AS concrete_m2 "
+            "FROM ("
+            "SELECT 'park' AS src, ST_Area(ST_Intersection(p.geometry, s.geometry)::geography) AS area "
+            "FROM osm_parks p, suburb s WHERE ST_Intersects(p.geometry, s.geometry) "
+            "AND ST_GeometryType(p.geometry) IN ('ST_Polygon','ST_MultiPolygon') "
+            "UNION ALL "
+            "SELECT 'building' AS src, ST_Area(ST_Intersection(b.geometry, s.geometry)::geography) AS area "
+            "FROM osm_buildings b, suburb s WHERE ST_Intersects(b.geometry, s.geometry)"
+            ") areas "
+            ") "
+            "SELECT 'park' AS feature_type, NULL::numeric AS count, "
+            "p.name, "
+            "ROUND(ST_Area(ST_Intersection(p.geometry, s.geometry)::geography)::numeric) AS area_m2, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS green_to_concrete_ratio, "
+            "ROUND((100.0 * st.green_m2 / st.total_m2)::numeric, 2) AS green_pct, "
+            "ROUND((100.0 * st.concrete_m2 / st.total_m2)::numeric, 2) AS building_pct, "
+            "ST_AsGeoJSON(ST_Intersection(p.geometry, s.geometry)) AS geojson "
+            "FROM osm_parks p, suburb s, stats st "
+            "WHERE ST_Intersects(p.geometry, s.geometry) "
+            "AND ST_GeometryType(p.geometry) IN ('ST_Polygon','ST_MultiPolygon') "
+            "UNION ALL "
+            "SELECT 'building' AS feature_type, NULL::numeric AS count, "
+            "b.name, "
+            "ROUND(ST_Area(ST_Intersection(b.geometry, s.geometry)::geography)::numeric) AS area_m2, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS green_to_concrete_ratio, "
+            "ROUND((100.0 * st.green_m2 / st.total_m2)::numeric, 2) AS green_pct, "
+            "ROUND((100.0 * st.concrete_m2 / st.total_m2)::numeric, 2) AS building_pct, "
+            "ST_AsGeoJSON(ST_Intersection(b.geometry, s.geometry)) AS geojson "
+            "FROM osm_buildings b, suburb s, stats st "
+            "WHERE ST_Intersects(b.geometry, s.geometry) "
+            "UNION ALL "
+            "SELECT 'green_area_m2' AS feature_type, ROUND(st.green_m2::numeric) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson FROM stats st "
+            "UNION ALL "
+            "SELECT 'building_area_m2' AS feature_type, ROUND(st.concrete_m2::numeric) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson FROM stats st "
+            "UNION ALL "
+            "SELECT 'green_to_concrete_ratio' AS feature_type, "
+            "ROUND((st.green_m2 / NULLIF(st.concrete_m2, 0))::numeric, 4) AS count, "
+            "NULL, NULL, NULL, NULL, NULL, NULL::text AS geojson FROM stats st "
+            "LIMIT 500;"
+        )
+    },
+    # Pattern 19: Density variant phrasing
+    {
+        "role": "user",
+        "content": "Rank suburbs by cafe density"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT b.name AS suburb, "
+            "COUNT(r.id) AS cafe_count, "
+            "ROUND(ST_Area(b.geometry::geography)::numeric / 1000000, 4) AS area_km2, "
+            "ROUND((COUNT(r.id) / (ST_Area(b.geometry::geography) / 1000000))::numeric, 2) AS cafes_per_km2, "
+            "ST_AsGeoJSON(b.geometry) AS geojson "
+            "FROM osm_boundaries b "
+            "LEFT JOIN osm_restaurants r ON ST_Within(r.geometry, b.geometry) AND r.amenity = 'cafe' "
+            "WHERE b.admin_level = '9' "
+            "GROUP BY b.id, b.name, b.geometry "
+            "HAVING COUNT(r.id) > 0 "
+            "ORDER BY cafes_per_km2 DESC "
+            "LIMIT 20;"
+        )
+    },
+    # Pattern 20: NOT EXISTS variant — schools with no restaurant within 500m
+    {
+        "role": "user",
+        "content": "Which schools have no restaurant within 500 metres?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT s.name, ST_AsGeoJSON(s.geometry) AS geojson "
+            "FROM osm_schools s "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM osm_restaurants r "
+            "WHERE ST_DWithin(s.geometry::geography, r.geometry::geography, 500)"
+            ") "
+            "AND s.name IS NOT NULL "
+            "ORDER BY s.name "
+            "LIMIT 50;"
+        )
+    },
+    # Pattern 21: Parks near waterways
+    {
+        "role": "user",
+        "content": "Show parks near the River Torrens"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT p.name, "
+            "ROUND(ST_Distance(p.geometry::geography, "
+            "(SELECT ST_Centroid(geometry) FROM osm_waterways WHERE name ILIKE '%Torrens%' LIMIT 1)::geography)) AS distance_meters, "
+            "ST_AsGeoJSON(p.geometry) AS geojson "
+            "FROM osm_parks p "
+            "WHERE ST_DWithin("
+            "p.geometry::geography, "
+            "(SELECT geometry FROM osm_waterways WHERE name ILIKE '%Torrens%' LIMIT 1)::geography, "
+            "500) "
+            "AND p.name IS NOT NULL "
+            "ORDER BY p.geometry <-> (SELECT ST_Centroid(geometry) FROM osm_waterways WHERE name ILIKE '%Torrens%' LIMIT 1) "
+            "LIMIT 50;"
+        )
+    },
+    # Pattern 22: School count per suburb ranked
+    {
+        "role": "user",
+        "content": "Which suburbs have the most schools?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT b.name AS suburb, "
+            "COUNT(s.id) AS school_count, "
+            "ST_AsGeoJSON(b.geometry) AS geojson "
+            "FROM osm_boundaries b "
+            "LEFT JOIN osm_schools s ON ST_Within(s.geometry, b.geometry) "
+            "WHERE b.admin_level = '9' "
+            "GROUP BY b.id, b.name, b.geometry "
+            "HAVING COUNT(s.id) > 0 "
+            "ORDER BY school_count DESC "
+            "LIMIT 20;"
+        )
+    },
+    # Pattern 23: Hospital + nearby pharmacy chain — multi-hop style
+    {
+        "role": "user",
+        "content": "For each hospital, show the nearest pharmacy"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT DISTINCT ON (h.id) "
+            "h.name AS hospital, "
+            "p.name AS nearest_pharmacy, "
+            "ROUND(ST_Distance(h.geometry::geography, p.geometry::geography)) AS distance_m, "
+            "ST_AsGeoJSON(h.geometry) AS geojson "
+            "FROM osm_hospitals h "
+            "CROSS JOIN LATERAL ("
+            "SELECT id, name, geometry FROM osm_pharmacies "
+            "ORDER BY osm_pharmacies.geometry <-> h.geometry "
+            "LIMIT 1"
+            ") p "
+            "WHERE h.name IS NOT NULL "
+            "ORDER BY h.id, distance_m "
+            "LIMIT 50;"
         )
     },
 ]
@@ -186,61 +783,29 @@ FEW_SHOT_EXAMPLES = [
 
 def query_requires_device_location(query: str) -> bool:
     """Return True when the query refers to the user's current location."""
-    normalized_query = query.strip().lower()
-
-    if normalized_query == "me":
+    normalized = query.strip().lower()
+    if normalized == "me":
         return True
-
     return any(
-        re.search(pattern, normalized_query, re.IGNORECASE)
+        re.search(pattern, normalized, re.IGNORECASE)
         for pattern in DEVICE_LOCATION_PATTERNS
     )
 
 
-def _resolve_location_in_query(query: str) -> tuple[str, tuple[float, float] | None]:
+def _build_device_location_context(coords: tuple[float, float]) -> str:
     """
-    Try to extract and resolve a location from the user query.
-    Returns the (possibly augmented) query and resolved coordinates.
+    Build the device-location context string injected into the system prompt.
+    Only called when the user explicitly requested a 'near me' query and the
+    browser returned GPS coordinates. This is the ONLY case where coordinates
+    are injected into the prompt at runtime.
     """
-    if query_requires_device_location(query):
-        return query, None
-
-    coords = None
-
-    # Try common patterns: "near X", "around X", "in X", "close to X", "within X of Y"
-    location_patterns = [
-        r"(?:near|nearby|around|close to|next to|by)\s+(.+?)(?:\s*$|\s+(?:that|which|with|and))",
-        r"within\s+\d+\s*(?:km|m|meters?|kilometres?|kilometers?|miles?)\s+(?:of|from)\s+(.+?)(?:\s*$|\s+(?:that|which|with|and))",
-        r"(?:in|at)\s+(.+?)(?:\s*$|\s+(?:that|which|with|and))",
-    ]
-
-    for pattern in location_patterns:
-        match = re.search(pattern, query, re.IGNORECASE)
-        if match:
-            place_name = match.group(1).strip().rstrip("?.,!")
-            result = geocode(place_name)
-            if result:
-                coords = result
-                break
-
-    return query, coords
-
-
-def _build_location_context(
-    coords: tuple[float, float] | None,
-    *,
-    source: str = "place",
-) -> str:
-    """Build a location context string for the prompt."""
-    if coords:
-        lat, lng = coords
-        location_label = "device location" if source == "device" else "location reference"
-        return (
-            f"\nUSER LOCATION CONTEXT: The user's {location_label} is "
-            f"latitude={lat}, longitude={lng}. "
-            f"Use MakePoint({lng}, {lat}, 4326) for this location in the query."
-        )
-    return ""
+    lat, lng = coords
+    return (
+        f"\nDEVICE GPS CONTEXT: The user's current location is "
+        f"latitude={lat}, longitude={lng}. "
+        f"Use ST_SetSRID(ST_MakePoint({lng}, {lat}), 4326) for this location. "
+        f"Do NOT use a subquery — use the exact coordinates above."
+    )
 
 
 def generate_sql(
@@ -248,15 +813,24 @@ def generate_sql(
     schema_context: str,
     allowed_tables: set[str],
     device_coords: tuple[float, float] | None = None,
-    model: str = "llama3.1:8b",
+    model: str | None = None,
     max_retries: int = 3,
+    conversation_history: list[dict] | None = None,
 ) -> tuple[str, str | None]:
     """
-    Generate a validated SpatiaLite SQL query from natural language.
+    Generate a validated PostGIS SQL query from natural language.
 
-    Returns (sql, error) tuple. If successful, error is None.
-    If all retries fail, sql is empty and error contains the last error message.
+    Place names are resolved entirely inside PostGIS via subqueries.
+    Device GPS coordinates are injected only for 'near me' queries.
+    conversation_history is a list of prior {"role": "user"|"assistant", "content": str}
+    turns injected between few-shots and the current query so the LLM can resolve
+    follow-up references ("those", "same area", "now filter by...").
+
+    Returns (sql, error). If successful, error is None.
     """
+    if model is None:
+        model = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
+
     validator = SQLValidator(allowed_tables)
 
     if query_requires_device_location(user_query) and device_coords is None:
@@ -265,31 +839,25 @@ def generate_sql(
             "Please share your device location and try again."
         )
 
-    # Resolve location references
-    if device_coords is not None:
-        query = user_query
-        coords = device_coords
-        location_context = _build_location_context(coords, source="device")
-    else:
-        query, coords = _resolve_location_in_query(user_query)
-        location_context = _build_location_context(coords)
-
-    # Build messages
+    # Build system prompt — only inject coords for device location queries
     system_content = SYSTEM_PROMPT.format(schema_context=schema_context)
-    if location_context:
-        system_content += location_context
+    if device_coords is not None:
+        system_content += _build_device_location_context(device_coords)
 
     messages = [
         {"role": "system", "content": system_content},
         *FEW_SHOT_EXAMPLES,
-        {"role": "user", "content": query},
+        *(conversation_history or []),
+        {"role": "user", "content": user_query},
     ]
 
     last_error = None
 
     for attempt in range(max_retries):
         try:
-            response = ollama.chat(
+            ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+            client = ollama.Client(host=ollama_host)
+            response = client.chat(
                 model=model,
                 messages=messages,
                 options={
@@ -302,21 +870,24 @@ def generate_sql(
             )
             raw_sql = response["message"]["content"]
 
-            # Validate the generated SQL
+            import sys
+            print(f"\n[SQL GEN attempt {attempt+1}]\n{raw_sql}\n", file=sys.stderr, flush=True)
+
             try:
                 validated_sql = validator.validate(raw_sql)
                 return validated_sql, None
             except ValidationError as e:
                 last_error = str(e)
-                # Feed the error back for self-correction
                 messages.append({"role": "assistant", "content": raw_sql})
                 messages.append({
                     "role": "user",
                     "content": (
                         f"ERROR: {last_error}. "
-                        f"Please fix the query. Output ONLY valid SpatiaLite SQL, "
-                        f"no markdown or explanation. "
-                        f"Available tables: {allowed_tables}"
+                        f"Please fix the query. Output ONLY valid PostGIS SQL, no markdown or explanation. "
+                        f"NEVER use ST_Extent — use osm_boundaries subquery instead. "
+                        f"NEVER invent table names like 'boundary', 'suburb', 'area' — only osm_* tables exist. "
+                        f"For suburb boundaries use: (SELECT geometry FROM osm_boundaries WHERE name ILIKE '%place%' ORDER BY admin_level DESC LIMIT 1). "
+                        f"Available tables: {sorted(allowed_tables)}"
                     ),
                 })
 
@@ -325,8 +896,98 @@ def generate_sql(
             if "connection refused" in error_str.lower() or "connect" in error_str.lower():
                 return "", (
                     "Cannot connect to Ollama. Make sure Ollama is running: "
-                    "`ollama serve` and the model is pulled: `ollama pull llama3.1:8b`"
+                    f"`ollama serve` and the model is pulled: `ollama pull {model}`"
                 )
             last_error = f"Ollama error: {error_str}"
 
     return "", f"Failed after {max_retries} attempts. Last error: {last_error}"
+
+
+def generate_analysis(
+    user_query: str,
+    sql: str,
+    stats: dict,
+    model: str | None = None,
+) -> str:
+    """
+    Call the analysis LLM to produce a natural language spatial summary.
+
+    Uses ANALYSIS_MODEL env var if set, otherwise falls back to OLLAMA_MODEL.
+    Returns a plain text paragraph. Returns empty string on failure.
+    """
+    analysis_model = os.getenv("ANALYSIS_MODEL", "").strip()
+    analysis_key   = os.getenv("ANALYSIS_API_KEY", "").strip()
+
+    count        = stats.get("count", 0)
+    geom_types   = stats.get("geometry_types", "unknown")
+    sample_names = stats.get("sample_names", [])
+    extra_stats  = {k: v for k, v in stats.items()
+                    if k not in ("count", "geometry_types", "sample_names")}
+
+    prompt = (
+        f"User asked: \"{user_query}\"\n"
+        f"SQL executed: {sql}\n"
+        f"Results: {count} features returned.\n"
+        f"Geometry types: {geom_types}\n"
+        f"Sample names: {', '.join(str(n) for n in sample_names[:5]) or 'N/A'}\n"
+        f"Statistics: {extra_stats}\n\n"
+        f"Provide:\n"
+        f"1. A 2-3 sentence spatial interpretation of what was found and why it matters.\n"
+        f"2. Any notable patterns, clusters, or distributions visible in the data.\n"
+        f"Be concise and factual."
+    )
+
+    if analysis_model and analysis_key:
+        # Cloud LLM via OpenAI-compatible API (e.g. openai/gpt-4o)
+        try:
+            import openai
+            client = openai.OpenAI(api_key=analysis_key)
+            resp = client.chat.completions.create(
+                model=analysis_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.3,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            pass
+
+    if analysis_model and not analysis_key:
+        # Ollama-hosted analysis model (local or cloud-backed via Ollama).
+        # ANALYSIS_THINKING=true enables extended chain-of-thought reasoning
+        # (supported by gemma4 and other thinking-capable Ollama models).
+        use_thinking = os.getenv("ANALYSIS_THINKING", "false").lower() == "true"
+        try:
+            ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+            client = ollama.Client(host=ollama_host)
+            kwargs = dict(
+                model=analysis_model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 1.0 if use_thinking else 0.3, "num_predict": 800},
+                stream=False,
+            )
+            if use_thinking:
+                kwargs["think"] = True
+            response = client.chat(**kwargs)
+            if use_thinking:
+                thinking = response["message"].get("thinking", "")
+                if thinking:
+                    import sys
+                    print(f"\n[ANALYSIS THINKING]\n{thinking}\n[/ANALYSIS THINKING]\n", file=sys.stderr, flush=True)
+            return response["message"]["content"].strip()
+        except Exception:
+            pass
+
+    try:
+        local_model = model or os.getenv("OLLAMA_MODEL", "gemma4:e4b")
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        client = ollama.Client(host=ollama_host)
+        response = client.chat(
+            model=local_model,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.3, "num_predict": 300},
+            stream=False,
+        )
+        return response["message"]["content"].strip()
+    except Exception:
+        return ""

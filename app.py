@@ -1,8 +1,14 @@
 """
-Natural Language Spatial Search - Streamlit Application
+Natural Language Spatial Search — Tabbed Chat + Map Interface.
 
-A proof-of-concept app that translates natural language queries into
-SpatiaLite SQL and visualizes results on an interactive map.
+Tab 1 (Chat): full conversation with follow-up context, suggested chips, schema browser.
+Tab 2 (Map):  persistent Folium map, updates after every query, basemap switcher.
+
+Powered by:
+  - PostGIS SQL generation (Ollama local LLM) with conversation history
+  - Hybrid RAG schema retrieval (pgvector + nomic-embed-text)
+  - Spatial analysis agent (second LLM call)
+  - Apache AGE property graph context
 """
 
 import os
@@ -16,44 +22,56 @@ import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_js_eval import get_geolocation
 
-from core.schema import introspect_gpkg, format_schema_for_llm, get_table_names
+from core.schema import introspect_db, format_schema_for_llm, get_table_names
+from core.rag import HybridRAG
 from core.llm import generate_sql, query_requires_device_location
 from core.executor import execute_query
+from core.analyst import analyse
 from core.geocoder import get_adelaide_center
+from core.graph import get_graph_context_for_query, get_graph_summary, graph_is_available
 
-# Load .env file (OLLAMA_HOST, OLLAMA_MODEL, GPKG_PATH, etc.)
 load_dotenv()
 
-# --- Configuration ---
-GPKG_PATH = os.environ.get("GPKG_PATH", "data/adelaide_osm.gpkg")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+# ─── configuration ────────────────────────────────────────────────────────────
 
-# Available basemap tile layers (name -> folium tiles arg)
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
+
+# Max prior conversation turns passed to the LLM for follow-up context.
+# Each turn = 1 user message + 1 assistant SQL message.
+# Keep small to avoid blowing the context window.
+CONVERSATION_HISTORY_TURNS = 3
+
 BASEMAP_OPTIONS = {
     "Dark (CartoDB Dark Matter)": "CartoDB dark_matter",
-    "Light (CartoDB Positron)": "CartoDB positron",
-    "OpenStreetMap": "OpenStreetMap"
+    "Light (CartoDB Positron)":   "CartoDB positron",
+    "OpenStreetMap":              "OpenStreetMap",
 }
 
-# Attribution strings for custom tile URLs
-BASEMAP_ATTR = {
-    "Satellite (Esri WorldImagery)": "Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics",
-    "Topo (OpenTopoMap)": 'Map data &copy; <a href="https://openstreetmap.org">OpenStreetMap</a> contributors, SRTM | Style &copy; <a href="https://opentopomap.org">OpenTopoMap</a>',
-    "Watercolor (Stamen)": 'Map tiles by <a href="https://stamen.com">Stamen Design</a>, under <a href="https://creativecommons.org/licenses/by/3.0">CC BY 3.0</a>. Data by <a href="https://openstreetmap.org">OpenStreetMap</a>',
-}
-
-# Geometry type to color mapping
 GEOM_COLORS = {
-    "Point": "#e74c3c",
-    "MultiPoint": "#e74c3c",
-    "LineString": "#3498db",
-    "MultiLineString": "#3498db",
-    "Polygon": "#2ecc71",
-    "MultiPolygon": "#27ae60",
+    "Point":              "#e74c3c",
+    "MultiPoint":         "#e74c3c",
+    "LineString":         "#3498db",
+    "MultiLineString":    "#3498db",
+    "Polygon":            "#2ecc71",
+    "MultiPolygon":       "#27ae60",
     "GeometryCollection": "#9b59b6",
 }
 
-# Example queries for the sidebar
+# Override colours by feature_type value (used in green-vs-buildings and UNION ALL queries)
+FEATURE_TYPE_COLORS = {
+    "park":     "#27ae60",   # green
+    "building": "#e67e22",   # orange
+    "green":    "#27ae60",
+    "concrete": "#e67e22",
+    "cafe":     "#9b59b6",
+    "school":   "#3498db",
+    "hospital": "#e74c3c",
+    "pharmacy": "#f39c12",
+    "road":     "#95a5a6",
+    "waterway": "#2980b9",
+    "railway":  "#7f8c8d",
+}
+
 EXAMPLE_QUERIES = [
     "Find 5 schools near Adelaide CBD",
     "Show me restaurants within 2km of Glenelg Beach",
@@ -67,270 +85,154 @@ EXAMPLE_QUERIES = [
     "What landuse types are near Adelaide Airport?",
     "Find pharmacies near North Adelaide",
     "Show railway lines",
-    "Find parks near me",
+    "Compare green areas vs buildings in the Adelaide CBD",
+    "Which suburbs have the most restaurants per square kilometre?",
+    "Which hospitals have no pharmacy within 1km?",
+    "Rank suburbs by cafe density",
+    "Which schools have no restaurant within 500 metres?",
+    "Show parks near the River Torrens",
+    "Which suburbs have the most schools?",
+    "For each hospital, show the nearest pharmacy",
 ]
 
+# ─── page config ──────────────────────────────────────────────────────────────
 
-def get_device_location(
-    component_key: str,
-) -> tuple[tuple[float, float] | None, str | None, bool]:
-    """Request the browser's geolocation and normalize the response."""
-    location = get_geolocation(component_key=component_key)
-
-    if not location:
-        return None, None, True
-
-    if "error" in location:
-        error = location["error"]
-        code = error.get("code")
-        message = error.get("message", "Unknown geolocation error.")
-
-        if code == 1:
-            return None, (
-                "Location permission was denied. "
-                "Allow browser location access to search near you."
-            ), False
-        return None, f"Unable to retrieve device location: {message}", False
-
-    coords = location.get("coords", {})
-    latitude = coords.get("latitude")
-    longitude = coords.get("longitude")
-
-    if latitude is None or longitude is None:
-        return None, "Unable to read device coordinates from the browser response.", False
-
-    return (latitude, longitude), None, False
+st.set_page_config(
+    page_title="Geo-Agentic Spatial Search",
+    page_icon="🌏",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 
-def execute_search(
-    user_query: str,
-    schema_text: str,
-    table_names: set[str],
-    device_coords: tuple[float, float] | None = None,
-):
-    """Generate SQL, execute it, and store results in session state."""
-    with st.spinner("Generating spatial SQL..."):
-        sql, error = generate_sql(
-            user_query=user_query,
-            schema_context=schema_text,
-            allowed_tables=table_names,
-            device_coords=device_coords,
-            model=OLLAMA_MODEL,
-        )
+# ─── schema (cached) ──────────────────────────────────────────────────────────
 
-    if error:
-        st.session_state["last_error"] = f"SQL Generation Error: {error}"
-        return
-
-    st.session_state["last_sql"] = sql
-
-    with st.spinner("Executing query..."):
-        result = execute_query(GPKG_PATH, sql)
-
-    if result.error:
-        st.session_state["last_error"] = f"Execution Error: {result.error}"
-        st.session_state["last_sql"] = sql
-        return
-
-    st.session_state["last_row_count"] = result.row_count
-    st.session_state["last_has_geometry"] = result.has_geometry
-
-    if result.has_geometry and result.gdf is not None and not result.gdf.empty:
-        selected_basemap = st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)")
-        st.session_state["last_map_html"] = build_map_html(
-            result.gdf,
-            selected_basemap,
-            device_coords=st.session_state.get("device_location"),
-        )
-        st.session_state["last_gdf"] = result.gdf
-        st.session_state["last_basemap"] = selected_basemap
-        st.session_state["last_table_df"] = result.gdf.drop(
-            columns=["geometry"], errors="ignore"
-        ).reset_index(drop=True)
-        st.session_state["last_geom_types"] = result.gdf.geom_type.unique().tolist()
-    elif result.raw_rows:
-        st.session_state["last_table_df"] = pd.DataFrame(result.raw_rows)
-
-    st.session_state["query_history"].append({
-        "query": user_query,
-        "sql": sql,
-        "count": result.row_count,
-    })
+@st.cache_data(ttl=300)
+def load_schema():
+    """Load and cache the database schema from PostgreSQL."""
+    try:
+        tables = introspect_db()
+        schema_text = format_schema_for_llm(tables)
+        table_names = get_table_names(tables)
+        return tables, schema_text, table_names
+    except Exception:
+        return None, None, None
 
 
-def setup_page():
-    """Configure the Streamlit page."""
-    st.set_page_config(
-        page_title="Spatial Search - Natural Language",
-        page_icon="🌍",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
+# ─── map helpers ──────────────────────────────────────────────────────────────
 
-
-@st.cache_data
-def load_schema(gpkg_path: str):
-    """Load and cache the database schema."""
-    tables = introspect_gpkg(gpkg_path)
-    schema_text = format_schema_for_llm(tables)
-    table_names = get_table_names(tables)
-    return tables, schema_text, table_names
-
+# Bounding box for South Australia — map cannot be panned/zoomed outside this
+SA_BOUNDS = [[-38.5, 128.0], [-26.0, 141.0]]  # [[south, west], [north, east]]
+SA_MIN_ZOOM = 7
+SA_MAX_ZOOM = 18
 
 def _create_base_map(basemap_name: str) -> folium.Map:
-    """Create a Folium map with the selected basemap and layer control."""
     center = get_adelaide_center()
-    tiles_arg = BASEMAP_OPTIONS[basemap_name]
-    attr = BASEMAP_ATTR.get(basemap_name)
-
-    # Built-in folium tile names vs custom URLs
-    if tiles_arg.startswith("http"):
-        m = folium.Map(location=list(center), zoom_start=12, tiles=None)
-        folium.TileLayer(
-            tiles=tiles_arg, attr=attr or "", name=basemap_name, max_zoom=19,
-        ).add_to(m)
-    else:
-        m = folium.Map(location=list(center), zoom_start=12, tiles=None)
-        folium.TileLayer(tiles=tiles_arg, name=basemap_name).add_to(m)
-
-    # Add all other basemaps as toggleable layers
+    tiles_arg = BASEMAP_OPTIONS.get(basemap_name, "CartoDB dark_matter")
+    m = folium.Map(
+        location=list(center),
+        zoom_start=12,
+        tiles=None,
+        min_zoom=SA_MIN_ZOOM,
+        max_zoom=SA_MAX_ZOOM,
+        max_bounds=True,
+        min_lat=SA_BOUNDS[0][0],
+        max_lat=SA_BOUNDS[1][0],
+        min_lon=SA_BOUNDS[0][1],
+        max_lon=SA_BOUNDS[1][1],
+    )
+    folium.TileLayer(tiles=tiles_arg, name=basemap_name).add_to(m)
     for name, tiles in BASEMAP_OPTIONS.items():
-        if name == basemap_name:
-            continue
-        extra_attr = BASEMAP_ATTR.get(name)
-        if tiles.startswith("http"):
-            folium.TileLayer(
-                tiles=tiles, attr=extra_attr or "", name=name, max_zoom=19,
-            ).add_to(m)
-        else:
+        if name != basemap_name:
             folium.TileLayer(tiles=tiles, name=name).add_to(m)
-
+    # Enforce the SA bounding box so the user cannot pan outside
+    m.fit_bounds(SA_BOUNDS)
     return m
 
 
-def _add_current_location_controls(
-    m: folium.Map,
-    device_coords: tuple[float, float] | None = None,
-):
-    """Add current-location controls and overlays to the map."""
-    plugins.LocateControl(
-        auto_start=False,
-        flyTo=True,
-        keepCurrentZoomLevel=False,
-        showCompass=True,
-        strings={"title": "Show my location"},
-    ).add_to(m)
-
+def _add_location_marker(m: folium.Map, device_coords: tuple[float, float] | None) -> None:
     if device_coords is None:
         return
-
+    plugins.LocateControl(
+        auto_start=False, flyTo=True, showCompass=True,
+        strings={"title": "Show my location"},
+    ).add_to(m)
     lat, lng = device_coords
     folium.CircleMarker(
-        location=[lat, lng],
-        radius=9,
-        color="#111827",
-        weight=2,
-        fill=True,
-        fill_color="#f59e0b",
-        fill_opacity=0.95,
+        location=[lat, lng], radius=9, color="#111827", weight=2,
+        fill=True, fill_color="#f59e0b", fill_opacity=0.95,
         tooltip="Your current location",
-        popup=folium.Popup("Your current location", max_width=220),
     ).add_to(m)
     folium.Circle(
-        location=[lat, lng],
-        radius=250,
-        color="#f59e0b",
-        weight=2,
-        fill=True,
-        fill_color="#fbbf24",
-        fill_opacity=0.12,
+        location=[lat, lng], radius=250, color="#f59e0b", weight=2,
+        fill=True, fill_color="#fbbf24", fill_opacity=0.12,
     ).add_to(m)
 
 
-def build_default_map_html(
-    basemap_name: str,
-    device_coords: tuple[float, float] | None = None,
-) -> str:
-    """Build a default Folium map centered on Adelaide with no overlays."""
-    m = _create_base_map(basemap_name)
-    _add_current_location_controls(m, device_coords)
+def build_default_map_html(basemap: str, device_coords=None) -> str:
+    m = _create_base_map(basemap)
+    _add_location_marker(m, device_coords)
     folium.LayerControl(collapsed=False).add_to(m)
     return m._repr_html_()
 
 
-def build_map_html(
-    gdf: gpd.GeoDataFrame,
-    basemap_name: str,
-    device_coords: tuple[float, float] | None = None,
-) -> str:
-    """Build a Folium map and return its HTML string."""
-    m = _create_base_map(basemap_name)
-    _add_current_location_controls(m, device_coords)
+def build_map_html(gdf: gpd.GeoDataFrame, basemap: str, device_coords=None) -> str:
+    m = _create_base_map(basemap)
+    _add_location_marker(m, device_coords)
 
     if gdf is not None and not gdf.empty:
-        # Auto-fit bounds to data
-        bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
-        fit_bounds = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
-        if device_coords is not None:
+        bounds = gdf.total_bounds
+        fit = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
+        if device_coords:
             lat, lng = device_coords
-            fit_bounds[0][0] = min(fit_bounds[0][0], lat)
-            fit_bounds[0][1] = min(fit_bounds[0][1], lng)
-            fit_bounds[1][0] = max(fit_bounds[1][0], lat)
-            fit_bounds[1][1] = max(fit_bounds[1][1], lng)
-        m.fit_bounds(fit_bounds)
+            fit[0][0] = min(fit[0][0], lat)
+            fit[0][1] = min(fit[0][1], lng)
+            fit[1][0] = max(fit[1][0], lat)
+            fit[1][1] = max(fit[1][1], lng)
+        # Clamp result fit_bounds to SA extents so we never zoom outside SA
+        fit[0][0] = max(fit[0][0], SA_BOUNDS[0][0])
+        fit[0][1] = max(fit[0][1], SA_BOUNDS[0][1])
+        fit[1][0] = min(fit[1][0], SA_BOUNDS[1][0])
+        fit[1][1] = min(fit[1][1], SA_BOUNDS[1][1])
+        m.fit_bounds(fit)
 
-        # Add features to map
-        for idx, row in gdf.iterrows():
+        for _, row in gdf.iterrows():
             geom = row.geometry
             if geom is None or geom.is_empty:
                 continue
+            # Prefer feature_type-based colour (UNION ALL / green-vs-buildings queries)
+            feature_type = str(row.get("feature_type", "")).lower() if "feature_type" in gdf.columns else ""
+            color = (
+                FEATURE_TYPE_COLORS.get(feature_type)
+                or GEOM_COLORS.get(geom.geom_type, "#95a5a6")
+            )
+            popup_parts = [
+                f"<b>{col}</b>: {row[col]}"
+                for col in gdf.columns
+                if col != "geometry" and row[col] is not None
+                and str(row[col]) not in ("", "None")
+            ]
+            popup_html = "<br>".join(popup_parts) or "No attributes"
 
-            geom_type = geom.geom_type
-            color = GEOM_COLORS.get(geom_type, "#95a5a6")
-
-            # Build popup content from non-geometry columns
-            popup_parts = []
-            for col in gdf.columns:
-                if col == "geometry":
-                    continue
-                val = row[col]
-                if val is not None and str(val) != "None" and str(val) != "":
-                    popup_parts.append(f"<b>{col}</b>: {val}")
-            popup_html = "<br>".join(popup_parts) if popup_parts else "No attributes"
-
-            if geom_type in ("Point", "MultiPoint"):
-                if geom_type == "Point":
-                    points = [geom]
-                else:
-                    points = list(geom.geoms)
-                for pt in points:
+            gtype = geom.geom_type
+            if gtype in ("Point", "MultiPoint"):
+                pts = [geom] if gtype == "Point" else list(geom.geoms)
+                for pt in pts:
                     folium.CircleMarker(
-                        location=[pt.y, pt.x],
-                        radius=7,
-                        color=color,
-                        fill=True,
-                        fill_opacity=0.8,
+                        location=[pt.y, pt.x], radius=7, color=color,
+                        fill=True, fill_opacity=0.8,
                         popup=folium.Popup(popup_html, max_width=300),
                     ).add_to(m)
-
-            elif geom_type in ("LineString", "MultiLineString"):
+            elif gtype in ("LineString", "MultiLineString"):
                 folium.GeoJson(
                     geom.__geo_interface__,
-                    style_function=lambda x, c=color: {
-                        "color": c,
-                        "weight": 3,
-                        "opacity": 0.8,
-                    },
+                    style_function=lambda x, c=color: {"color": c, "weight": 3, "opacity": 0.8},
                 ).add_to(m)
-
-            elif geom_type in ("Polygon", "MultiPolygon"):
+            elif gtype in ("Polygon", "MultiPolygon"):
                 folium.GeoJson(
                     geom.__geo_interface__,
                     style_function=lambda x, c=color: {
-                        "color": c,
-                        "weight": 2,
-                        "fillColor": c,
-                        "fillOpacity": 0.3,
+                        "color": c, "weight": 2, "fillColor": c, "fillOpacity": 0.3,
                     },
                 ).add_to(m)
 
@@ -338,301 +240,518 @@ def build_map_html(
     return m._repr_html_()
 
 
-def render_sidebar(tables, table_names):
-    """Render the sidebar with schema info and example queries."""
-    with st.sidebar:
-        st.header("Database Schema")
+# ─── device location helper ───────────────────────────────────────────────────
 
-        # Layer overview
-        for table in tables:
-            with st.expander(
-                f"{table.name} ({table.row_count} rows)",
-                expanded=False,
-            ):
-                if table.geometry_type:
-                    st.caption(f"Geometry: {table.geometry_type} (SRID {table.srid})")
-
-                cols = [c for c in table.columns if not c.is_geometry and c.name != "fid"]
-                if cols:
-                    col_names = [c.name for c in cols]
-                    st.text(f"Columns: {', '.join(col_names)}")
-
-                if table.sample_values:
-                    for col_name, vals in list(table.sample_values.items())[:3]:
-                        if col_name == "fid":
-                            continue
-                        st.text(f"  {col_name}: {', '.join(vals[:3])}")
-
-        st.divider()
-        st.header("Example Queries")
-        st.caption("Click to use:")
-
-        for query in EXAMPLE_QUERIES:
-            if st.button(query, key=f"example_{hash(query)}", width="stretch"):
-                st.session_state["pending_query"] = query
-                st.rerun()
-
-        st.divider()
-        st.header("Basemap")
-        basemap_names = list(BASEMAP_OPTIONS.keys())
-        st.selectbox(
-            "Select basemap:",
-            basemap_names,
-            index=0,
-            key="basemap_selection",
-        )
-
-        st.divider()
-        st.caption(f"Model: {OLLAMA_MODEL}")
-        st.caption(f"Database: {GPKG_PATH}")
+def get_device_location(component_key: str):
+    location = get_geolocation(component_key=component_key)
+    if not location:
+        return None, None, True
+    if "error" in location:
+        msg  = location["error"].get("message", "Unknown geolocation error.")
+        code = location["error"].get("code")
+        if code == 1:
+            return None, "Location permission denied. Allow browser location access.", False
+        return None, f"Unable to get device location: {msg}", False
+    coords = location.get("coords", {})
+    lat = coords.get("latitude")
+    lng = coords.get("longitude")
+    if lat is None or lng is None:
+        return None, "Could not read device coordinates.", False
+    return (lat, lng), None, False
 
 
-def main():
-    """Main application entry point."""
-    setup_page()
+# ─── conversation history builder ─────────────────────────────────────────────
 
-    st.title("Natural Language Spatial Search")
-    st.caption(
-        "Ask questions about Adelaide's spatial data in plain English. "
-        "Powered by Llama 3.1 via Ollama + SpatiaLite."
+def _build_conversation_history(messages: list[dict], max_turns: int) -> list[dict]:
+    """
+    Extract the last `max_turns` user/assistant exchange pairs from the session
+    message list and return them as plain {"role", "content"} dicts suitable for
+    injection into the LLM prompt.
+
+    Assistant messages are reduced to just their SQL so the context window stays
+    small — the LLM only needs to know *what was queried*, not the full rendered output.
+    """
+    history = []
+    # Walk backwards to find the last N complete turns (user + assistant SQL)
+    pairs = []
+    i = len(messages) - 1
+    while i >= 0 and len(pairs) < max_turns:
+        msg = messages[i]
+        if msg["role"] == "assistant" and not msg.get("error"):
+            # look for the preceding user message
+            if i > 0 and messages[i - 1]["role"] == "user":
+                pairs.append((messages[i - 1], msg))
+                i -= 2
+                continue
+        i -= 1
+
+    # Reverse so oldest turn comes first
+    for user_msg, asst_msg in reversed(pairs):
+        history.append({"role": "user", "content": user_msg["content"]})
+        sql = asst_msg.get("sql", "")
+        if sql:
+            history.append({"role": "assistant", "content": sql})
+
+    return history
+
+
+# ─── session state init ───────────────────────────────────────────────────────
+
+def _init_session():
+    defaults = {
+        "messages":               [],    # list of chat message dicts
+        "current_map_html":       None,  # latest map HTML
+        "current_gdf":            None,  # latest GeoDataFrame for basemap rerender
+        "basemap_selection":      "Dark (CartoDB Dark Matter)",
+        "device_location":        None,
+        "pending_location_query": None,
+        "location_request_key":   0,
+        "active_tab":             0,     # 0 = Chat, 1 = Map, 2 = Graph Explorer
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+# ─── core pipeline ────────────────────────────────────────────────────────────
+
+def run_pipeline(
+    user_query: str,
+    schema_text: str,
+    table_names: set[str],
+    all_tables,
+    device_coords=None,
+) -> dict:
+    """
+    Full RAG → SQL → Execute → Analyse pipeline.
+    Passes the last CONVERSATION_HISTORY_TURNS exchanges as context to the LLM
+    so follow-up queries resolve references to prior results.
+    Returns a result dict stored in messages.
+    """
+    # 1. Hybrid RAG schema retrieval
+    rag = HybridRAG()
+    relevant_tables = rag.retrieve(user_query)
+
+    ALWAYS_INCLUDE = {"osm_all", "osm_boundaries"}
+
+    if relevant_tables:
+        from core.schema import format_schema_for_llm as _fmt
+        want = set(relevant_tables) | ALWAYS_INCLUDE
+        filtered_tables = [t for t in all_tables if t.name in want]
+        rag_schema = _fmt(filtered_tables)
+        rag_table_names = {t.name for t in filtered_tables} | table_names
+    else:
+        rag_schema = schema_text
+        rag_table_names = table_names | ALWAYS_INCLUDE
+
+    # 2. Build conversation history for follow-up context
+    history = _build_conversation_history(
+        st.session_state["messages"], CONVERSATION_HISTORY_TURNS
     )
 
-    # Check if database exists
-    if not os.path.exists(GPKG_PATH):
-        st.error(
-            f"Database not found at `{GPKG_PATH}`. "
-            f"Run `python data/setup_data.py` first to download the Adelaide OSM data."
-        )
-        st.stop()
+    # 2b. Append graph context to schema string (non-blocking — silent if AGE down)
+    graph_ctx = get_graph_context_for_query(user_query)
+    if graph_ctx:
+        rag_schema = rag_schema + f"\n\n{graph_ctx}"
 
-    # Load schema
-    try:
-        tables, schema_text, table_names = load_schema(GPKG_PATH)
-    except Exception as e:
-        st.error(f"Error loading database schema: {e}")
-        st.stop()
-
-    # Render sidebar
-    render_sidebar(tables, table_names)
-
-    # Initialize session state
-    if "query_history" not in st.session_state:
-        st.session_state["query_history"] = []
-    if "last_sql" not in st.session_state:
-        st.session_state["last_sql"] = None
-    if "last_map_html" not in st.session_state:
-        st.session_state["last_map_html"] = None
-    if "last_table_df" not in st.session_state:
-        st.session_state["last_table_df"] = None
-    if "last_row_count" not in st.session_state:
-        st.session_state["last_row_count"] = None
-    if "last_has_geometry" not in st.session_state:
-        st.session_state["last_has_geometry"] = False
-    if "last_error" not in st.session_state:
-        st.session_state["last_error"] = None
-    if "last_geom_types" not in st.session_state:
-        st.session_state["last_geom_types"] = []
-    if "last_gdf" not in st.session_state:
-        st.session_state["last_gdf"] = None
-    if "last_basemap" not in st.session_state:
-        st.session_state["last_basemap"] = None
-    if "device_location" not in st.session_state:
-        st.session_state["device_location"] = None
-    if "pending_location_query" not in st.session_state:
-        st.session_state["pending_location_query"] = None
-    if "location_request_key" not in st.session_state:
-        st.session_state["location_request_key"] = 0
-    if "show_my_location_request" not in st.session_state:
-        st.session_state["show_my_location_request"] = False
-
-    # If an example query was clicked, pre-fill the input
-    default_value = st.session_state.pop("pending_query", "")
-
-    # Query input
-    user_query = st.text_input(
-        "Ask a spatial question:",
-        value=default_value,
-        placeholder="e.g., Find 5 schools near Adelaide CBD",
-        key="query_input",
+    # 3. Generate SQL
+    sql, error = generate_sql(
+        user_query=user_query,
+        schema_context=rag_schema,
+        allowed_tables=rag_table_names,
+        device_coords=device_coords,
+        model=OLLAMA_MODEL,
+        conversation_history=history,
     )
 
-    col1, col2 = st.columns([1, 5])
-    with col1:
-        run_button = st.button("Search", type="primary", width="stretch")
-    with col2:
-        if st.button("Show My Location", width="content"):
-            st.session_state["show_my_location_request"] = True
-            st.rerun()
+    if error:
+        return {"role": "assistant", "error": error, "sql": None}
 
-    # Process query -- only regenerate SQL + execute on button click
-    if run_button and user_query and user_query.strip():
-        # Clear previous results
-        st.session_state["last_sql"] = None
-        st.session_state["last_map_html"] = None
-        st.session_state["last_table_df"] = None
-        st.session_state["last_row_count"] = None
-        st.session_state["last_has_geometry"] = False
-        st.session_state["last_error"] = None
-        st.session_state["last_geom_types"] = []
+    # 4. Execute query
+    result = execute_query(sql)
 
-        device_coords = None
-        if query_requires_device_location(user_query):
-            request_key = f"geo_request_{st.session_state['location_request_key']}"
-            with st.spinner("Requesting your device location..."):
-                device_coords, location_error, waiting_for_location = get_device_location(
-                    component_key=request_key
-                )
+    if result.error:
+        return {"role": "assistant", "error": result.error, "sql": sql}
 
-            if waiting_for_location:
-                st.session_state["pending_location_query"] = user_query
-                st.info("Waiting for your browser to return device location...")
-                st.stop()
-            elif location_error:
-                st.session_state["last_error"] = location_error
-                st.session_state["device_location"] = None
-                st.session_state["pending_location_query"] = None
-            else:
-                st.session_state["device_location"] = device_coords
-                st.session_state["pending_location_query"] = None
-                st.session_state["location_request_key"] += 1
+    # 5. Analyse results
+    analysis = analyse(user_query, sql, result)
 
-        if not st.session_state["last_error"] and st.session_state["pending_location_query"] is None:
-            execute_search(user_query, schema_text, table_names, device_coords=device_coords)
-
-    elif run_button:
-        st.warning("Please enter a query.")
-
-    pending_location_query = st.session_state.get("pending_location_query")
-    if pending_location_query:
-        request_key = f"geo_request_{st.session_state['location_request_key']}"
-        device_coords, location_error, waiting_for_location = get_device_location(
-            component_key=request_key
+    # 6. Build map HTML
+    basemap = st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)")
+    if result.has_geometry and result.gdf is not None and not result.gdf.empty:
+        map_html = build_map_html(result.gdf, basemap, device_coords)
+        st.session_state["current_gdf"] = result.gdf
+    else:
+        map_html = st.session_state.get("current_map_html") or build_default_map_html(
+            basemap, device_coords
         )
 
-        if waiting_for_location:
-            # Still waiting for the browser to return the device location; show feedback and stop.
-            st.info("Waiting for your browser to return device location...")
-            st.stop()
-        if not waiting_for_location:
-            if location_error:
-                st.session_state["last_error"] = location_error
-                st.session_state["device_location"] = None
-                st.session_state["pending_location_query"] = None
-                st.session_state["location_request_key"] += 1
-                st.rerun()
-
-            st.session_state["device_location"] = device_coords
-            st.session_state["pending_location_query"] = None
-            st.session_state["location_request_key"] += 1
-            execute_search(
-                pending_location_query,
-                schema_text,
-                table_names,
-                device_coords=device_coords,
+    # 7. Build table dataframe
+    if result.has_geometry and result.gdf is not None:
+        table_df = result.gdf.drop(columns=["geometry"], errors="ignore").reset_index(drop=True)
+        # UNION ALL comparison queries: split geometry rows from stat/count summary rows
+        if "count" in table_df.columns and "feature_type" in table_df.columns:
+            count_rows = (
+                table_df[table_df["count"].notna()][["feature_type", "count"]]
+                .reset_index(drop=True)
             )
+            geom_rows = (
+                table_df[table_df["count"].isna()]
+                .drop(columns=["count"], errors="ignore")
+                .reset_index(drop=True)
+            )
+            table_df = geom_rows if not geom_rows.empty else table_df
+            if not count_rows.empty:
+                comparison = {
+                    row["feature_type"]: row["count"]
+                    for _, row in count_rows.iterrows()
+                }
+                if "comparison" not in analysis.stats:
+                    analysis.stats["comparison"] = comparison
+    elif result.raw_rows:
+        table_df = pd.DataFrame(result.raw_rows)
+    else:
+        table_df = None
 
-    if st.session_state.get("show_my_location_request"):
-        request_key = f"geo_preview_{st.session_state['location_request_key']}"
-        device_coords, location_error, waiting_for_location = get_device_location(
-            component_key=request_key
-        )
+    return {
+        "role":      "assistant",
+        "summary":   analysis.summary,
+        "stats":     analysis.stats,
+        "followups": analysis.followups,
+        "sql":       sql,
+        "map_html":  map_html,
+        "table_df":  table_df,
+        "row_count": result.row_count,
+        "error":     None,
+    }
 
-        if waiting_for_location:
-            st.info("Waiting for your browser to return device location...")
+
+# ─── render helpers ───────────────────────────────────────────────────────────
+
+def _render_assistant_message(msg: dict) -> None:
+    """Render a single assistant message inside st.chat_message context."""
+    if msg.get("error"):
+        st.error(msg["error"])
+        if msg.get("sql"):
+            with st.expander("Generated SQL"):
+                st.code(msg["sql"], language="sql")
+        return
+
+    row_count = msg.get("row_count", 0)
+    st.markdown(f"**{row_count} result{'s' if row_count != 1 else ''} found**")
+
+    summary = msg.get("summary", "")
+    if summary:
+        st.write(summary)
+
+    # Comparison metric cards (UNION ALL suburb-comparison / green-vs-buildings queries)
+    stats      = msg.get("stats", {})
+    comparison = stats.get("comparison", {})
+    if comparison:
+        st.markdown("**Summary:**")
+        cols = st.columns(len(comparison))
+        for i, (label, val) in enumerate(comparison.items()):
+            with cols[i]:
+                # Format: floats with 4dp for ratios, integers with comma for areas
+                try:
+                    fval = float(val)
+                    display = f"{fval:,.4f}" if fval != int(fval) else f"{int(fval):,}"
+                except (TypeError, ValueError):
+                    display = str(val)
+                # Prettify label
+                pretty = label.replace("_", " ").title()
+                st.metric(pretty, display)
+
+    if msg.get("sql"):
+        with st.expander("View SQL"):
+            st.code(msg["sql"], language="sql")
+
+    display_stats = {
+        k: v for k, v in stats.items()
+        if k not in ("sample_names", "comparison")
+    }
+    if display_stats and len(display_stats) > 1:
+        with st.expander("Statistics"):
+            st.json(display_stats)
+
+    if msg.get("table_df") is not None and not msg["table_df"].empty:
+        with st.expander("Data Table"):
+            st.dataframe(msg["table_df"], use_container_width=True)
+
+    # Follow-up suggestion chips
+    followups = msg.get("followups", [])
+    if followups:
+        st.caption("Suggested follow-ups:")
+        cols = st.columns(len(followups))
+        for i, fq in enumerate(followups):
+            with cols[i]:
+                if st.button(fq, key=f"fup_{hash(fq)}_{id(msg)}", use_container_width=True):
+                    st.session_state["_pending_chat_input"] = fq
+                    st.rerun()
+
+
+# ─── query processor (shared by chat input + follow-up chips) ─────────────────
+
+def _process_query(user_query: str, all_tables, schema_text, table_names) -> None:
+    """
+    Run the full pipeline for user_query, append messages, update map state.
+    Called from both the chat input handler and the pending-location handler.
+    """
+    st.session_state["messages"].append({"role": "user", "content": user_query})
+
+    device_coords = st.session_state.get("device_location")
+
+    # Handle device-location queries
+    if query_requires_device_location(user_query) and device_coords is None:
+        request_key = f"geo_{st.session_state['location_request_key']}"
+        coords, location_error, waiting = get_device_location(request_key)
+        if waiting:
+            st.session_state["pending_location_query"] = user_query
+            st.info("Waiting for browser location...")
+            st.stop()
         elif location_error:
-            st.session_state["last_error"] = location_error
-            st.session_state["show_my_location_request"] = False
+            st.session_state["messages"].append(
+                {"role": "assistant", "error": location_error, "sql": None}
+            )
             st.session_state["location_request_key"] += 1
             st.rerun()
         else:
-            st.session_state["device_location"] = device_coords
-            st.session_state["show_my_location_request"] = False
+            device_coords = coords
+            st.session_state["device_location"] = coords
             st.session_state["location_request_key"] += 1
-            if st.session_state.get("last_gdf") is not None:
-                selected_basemap = st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)")
-                st.session_state["last_map_html"] = build_map_html(
-                    st.session_state["last_gdf"],
-                    selected_basemap,
-                    device_coords=device_coords,
-                )
-                st.session_state["last_basemap"] = selected_basemap
-            else:
-                st.session_state["last_map_html"] = build_default_map_html(
-                    st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)"),
-                    device_coords=device_coords,
-                )
 
-    # --- Persistent map: always visible ---
-    selected_basemap = st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)")
-
-    # Re-render results map if basemap selection changed since last render
-    if (
-        st.session_state.get("last_gdf") is not None
-        and st.session_state.get("last_basemap") != selected_basemap
-    ):
-        st.session_state["last_map_html"] = build_map_html(
-            st.session_state["last_gdf"],
-            selected_basemap,
-            device_coords=st.session_state.get("device_location"),
+    with st.spinner("Thinking..."):
+        result_msg = run_pipeline(
+            user_query, schema_text, table_names, all_tables,
+            device_coords=device_coords,
         )
-        st.session_state["last_basemap"] = selected_basemap
 
-    # Show the map with results overlaid, or a default Adelaide view
-    map_html = st.session_state.get("last_map_html")
-    if map_html:
-        components.html(map_html, height=550, scrolling=False)
+    st.session_state["messages"].append(result_msg)
+    if result_msg.get("map_html"):
+        st.session_state["current_map_html"] = result_msg["map_html"]
 
-        # Legend
-        geom_types = st.session_state.get("last_geom_types", [])
-        legend_items = []
-        for gt in geom_types:
-            color = GEOM_COLORS.get(gt, "#95a5a6")
-            legend_items.append(f":{color[1:]}[●] {gt}")
-        if legend_items:
-            st.caption(" | ".join(legend_items))
-    else:
-        # Default Adelaide map -- always shown on load
-        components.html(
-            build_default_map_html(
-                selected_basemap,
+    st.rerun()
+
+
+# ─── main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    _init_session()
+
+    all_tables, schema_text, table_names = load_schema()
+
+    if schema_text is None:
+        st.error(
+            "Cannot connect to the database. "
+            "Make sure PostgreSQL is running: `docker-compose up -d` "
+            "and data is loaded: `python data/setup_db.py`"
+        )
+        st.stop()
+
+    st.title("Geo-Agentic Spatial Search")
+    st.caption(
+        "Ask questions about Adelaide's spatial data in plain English. "
+        "Powered by PostGIS · pgvector · Apache AGE · Ollama."
+    )
+
+    tab_chat, tab_map, tab_graph = st.tabs(["Chat", "Map", "Graph Explorer"])
+
+    # ── Tab 1: Chat ───────────────────────────────────────────────────────────
+    with tab_chat:
+        # Schema browser + example queries in the sidebar-style expanders at top
+        col_tools, col_spacer = st.columns([1, 2])
+        with col_tools:
+            with st.expander("Database Schema", expanded=False):
+                for table in all_tables:
+                    if table.name == "osm_all":
+                        continue
+                    geom_desc = f" ({table.geometry_type})" if table.geometry_type else ""
+                    st.markdown(f"**{table.name}** — {table.row_count} rows{geom_desc}")
+                    col_names = [
+                        c.name for c in table.columns
+                        if not c.is_geometry and c.name not in ("id", "osm_id")
+                    ]
+                    if col_names:
+                        st.caption(", ".join(col_names))
+
+            with st.expander("Example queries", expanded=False):
+                for q in EXAMPLE_QUERIES:
+                    if st.button(q, key=f"ex_{hash(q)}", use_container_width=True):
+                        st.session_state["_pending_chat_input"] = q
+                        st.rerun()
+
+        st.divider()
+
+        # Conversation history
+        for msg in st.session_state["messages"]:
+            with st.chat_message(msg["role"]):
+                if msg["role"] == "user":
+                    st.write(msg["content"])
+                else:
+                    _render_assistant_message(msg)
+
+        # Chat input
+        pending    = st.session_state.pop("_pending_chat_input", None)
+        user_input = st.chat_input("Ask a spatial question...", key="chat_input_box")
+        query_to_run = pending or user_input
+
+        if query_to_run and query_to_run.strip():
+            _process_query(
+                query_to_run.strip(), all_tables, schema_text, table_names
+            )
+
+        # Resume a pending device-location query from the previous render cycle
+        pending_loc_query = st.session_state.get("pending_location_query")
+        if pending_loc_query:
+            request_key = f"geo_{st.session_state['location_request_key']}"
+            coords, location_error, waiting = get_device_location(request_key)
+            if not waiting:
+                st.session_state["pending_location_query"] = None
+                st.session_state["location_request_key"] += 1
+                if location_error:
+                    st.session_state["messages"].append(
+                        {"role": "assistant", "error": location_error, "sql": None}
+                    )
+                    st.rerun()
+                else:
+                    st.session_state["device_location"] = coords
+                    with st.spinner("Thinking..."):
+                        result_msg = run_pipeline(
+                            pending_loc_query, schema_text, table_names, all_tables,
+                            device_coords=coords,
+                        )
+                    st.session_state["messages"].append(result_msg)
+                    if result_msg.get("map_html"):
+                        st.session_state["current_map_html"] = result_msg["map_html"]
+                    st.rerun()
+
+    # ── Tab 2: Map ────────────────────────────────────────────────────────────
+    with tab_map:
+        basemap = st.selectbox(
+            "Basemap",
+            list(BASEMAP_OPTIONS.keys()),
+            index=0,
+            key="basemap_selection",
+            label_visibility="collapsed",
+        )
+
+        # Re-render when basemap changes
+        current_gdf = st.session_state.get("current_gdf")
+        if current_gdf is not None:
+            st.session_state["current_map_html"] = build_map_html(
+                current_gdf, basemap,
                 device_coords=st.session_state.get("device_location"),
-            ),
-            height=550,
-            scrolling=False,
+            )
+
+        map_html = st.session_state.get("current_map_html") or build_default_map_html(
+            basemap, device_coords=st.session_state.get("device_location")
+        )
+        components.html(map_html, height=700, scrolling=False)
+
+        # Show which query produced the current map
+        messages = st.session_state.get("messages", [])
+        last_user = next(
+            (m["content"] for m in reversed(messages) if m["role"] == "user"), None
+        )
+        if last_user:
+            st.caption(f"Showing results for: *{last_user}*")
+
+    # ── Tab 3: Graph Explorer ─────────────────────────────────────────────────
+    with tab_graph:
+        st.markdown("### Apache AGE Graph Explorer")
+        st.caption(
+            "Run openCypher queries directly against the `osm_spatial` property graph. "
+            "Node labels: School, Hospital, Restaurant, Pharmacy, Park, Building, "
+            "Road, Waterway, Railway, Landuse, NaturalFeature, Boundary. "
+            "Edge types: NEAR (distance_m), WITHIN (boundary_name)."
         )
 
-    # --- Results info and SQL below the map ---
-    if st.session_state.get("last_error"):
-        st.error(st.session_state["last_error"])
-        if st.session_state.get("last_sql"):
-            with st.expander("Generated SQL", expanded=True):
-                st.code(st.session_state["last_sql"], language="sql")
-        st.info("Try rephrasing your question.")
+        graph_available = graph_is_available()
+        if not graph_available:
+            st.warning(
+                "Graph is not available. Ensure the database is running and "
+                "`python data/setup_db.py` has been run to build the AGE graph."
+            )
+        else:
+            # Edge summary
+            with st.expander("Graph Statistics", expanded=True):
+                summary = get_graph_summary()
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("NEAR edges", f"{summary.get('near_total', 0):,}")
+                with col2:
+                    st.metric("WITHIN edges", f"{summary.get('within_total', 0):,}")
 
-    elif st.session_state.get("last_sql"):
-        row_count = st.session_state.get("last_row_count")
-        if row_count is not None:
-            st.success(f"Found {row_count} results")
+                near_pairs = summary.get("near", {})
+                if near_pairs:
+                    st.markdown("**NEAR edge pairs:**")
+                    pairs_data = [
+                        {"Relationship": k, "Count": v}
+                        for k, v in sorted(near_pairs.items(), key=lambda x: -x[1])
+                    ]
+                    st.dataframe(pd.DataFrame(pairs_data), use_container_width=True, hide_index=True)
 
-        with st.expander("Generated SQL", expanded=False):
-            st.code(st.session_state["last_sql"], language="sql")
+            # Example Cypher queries
+            cypher_examples = [
+                "MATCH (s:School)-[r:NEAR]->(p:Park) RETURN s.name AS school, p.name AS park, r.distance_m AS distance_m ORDER BY r.distance_m LIMIT 10",
+                "MATCH (h:Hospital)-[r:NEAR]->(p:Pharmacy) RETURN h.name AS hospital, p.name AS pharmacy, r.distance_m AS distance_m ORDER BY r.distance_m LIMIT 10",
+                "MATCH (r:Restaurant)-[n:NEAR]->(p:Park) RETURN r.name AS restaurant, p.name AS park, n.distance_m AS distance_m ORDER BY n.distance_m LIMIT 10",
+                "MATCH (s:School)-[:WITHIN]->(b:Boundary) RETURN b.name AS suburb, count(s) AS school_count ORDER BY school_count DESC LIMIT 15",
+                "MATCH (h:Hospital)-[:NEAR]->(p:Pharmacy) WITH h, count(p) AS nearby_pharmacies RETURN h.name AS hospital, nearby_pharmacies ORDER BY nearby_pharmacies DESC LIMIT 10",
+            ]
+            with st.expander("Example Cypher queries", expanded=False):
+                for ex in cypher_examples:
+                    if st.button(ex[:80] + ("..." if len(ex) > 80 else ""), key=f"cypher_ex_{hash(ex)}", use_container_width=True):
+                        st.session_state["_pending_cypher"] = ex
+                        st.rerun()
 
-        table_df = st.session_state.get("last_table_df")
-        if table_df is not None and not table_df.empty:
-            with st.expander("Data Table", expanded=False):
-                st.dataframe(table_df, width="stretch")
+            # Cypher input
+            pending_cypher = st.session_state.pop("_pending_cypher", None)
+            cypher_input = st.text_area(
+                "Cypher query",
+                value=pending_cypher or "",
+                height=100,
+                placeholder="MATCH (s:School)-[r:NEAR]->(p:Park) RETURN s.name, p.name, r.distance_m LIMIT 10",
+                key="cypher_input_box",
+            )
+            run_cypher = st.button("Run Cypher", type="primary")
 
-        elif row_count == 0:
-            st.info("No results found. Try a different query.")
+            if run_cypher and cypher_input.strip():
+                from core.graph import _cypher
+                with st.spinner("Running Cypher query..."):
+                    rows = _cypher(cypher_input.strip())
 
-    # Show query history
-    if st.session_state.get("query_history"):
-        with st.expander("Query History", expanded=False):
-            for i, entry in enumerate(reversed(st.session_state["query_history"])):
-                st.text(f"{len(st.session_state['query_history']) - i}. {entry['query']}")
-                st.code(entry["sql"], language="sql")
-                st.caption(f"Results: {entry['count']}")
-                st.divider()
+                if not rows:
+                    st.info("No results returned.")
+                else:
+                    # Parse agtype rows into a DataFrame
+                    import json
+                    parsed = []
+                    for row in rows:
+                        parsed_row = {}
+                        for i, val in enumerate(row):
+                            val_str = str(val)
+                            try:
+                                parsed_row[f"col_{i}"] = json.loads(val_str)
+                            except (json.JSONDecodeError, TypeError):
+                                # Strip surrounding quotes from agtype strings
+                                parsed_row[f"col_{i}"] = val_str.strip('"')
+                        parsed.append(parsed_row)
+
+                    df = pd.DataFrame(parsed)
+                    st.success(f"{len(df)} rows returned")
+                    st.dataframe(df, use_container_width=True)
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### Settings")
+        st.caption(f"Model: `{OLLAMA_MODEL}`")
+        st.caption(f"Follow-up context: last {CONVERSATION_HISTORY_TURNS} turns")
+        if st.button("Clear conversation"):
+            st.session_state["messages"]         = []
+            st.session_state["current_map_html"] = None
+            st.session_state["current_gdf"]      = None
+            st.rerun()
 
 
 if __name__ == "__main__":

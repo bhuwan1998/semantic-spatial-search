@@ -1,9 +1,9 @@
 """
 SQL Validator Module - Validates and sanitizes LLM-generated spatial SQL.
 
-Ensures only safe SELECT queries run against the GeoPackage by:
+Ensures only safe SELECT queries run against PostGIS by:
 - Rejecting DML/DDL statements
-- Whitelisting allowed tables and SpatiaLite functions
+- Whitelisting allowed tables and PostGIS functions
 - Auto-injecting LIMIT clauses
 - Stripping markdown artifacts
 """
@@ -13,53 +13,54 @@ import re
 import sqlparse
 
 
-# SpatiaLite functions that are safe to use
+# PostGIS functions that are safe to use
 ALLOWED_FUNCTIONS = {
     # Spatial relationships
     "st_intersects", "st_contains", "st_within", "st_covers",
     "st_coveredby", "st_crosses", "st_touches", "st_overlaps",
-    "st_disjoint", "st_equals",
-    # Measurements
+    "st_disjoint", "st_equals", "st_dwithin",
+    # Measurements (PostGIS)
     "st_distance", "st_area", "st_length", "st_perimeter",
-    # Constructors
-    "makepoint", "st_point", "st_geomfromtext", "st_geomfromgeojson",
-    "st_setsrid", "st_makeenvelope", "buildcirclembr", "buildmbr",
-    "makeline", "makepolygon",
+    # Constructors (PostGIS)
+    "st_makepoint", "st_point", "st_geomfromtext", "st_geomfromgeojson",
+    "st_setsrid", "st_makeenvelope", "st_makeline", "st_makepolygon",
+    "st_geogfromtext",
     # Processing
     "st_centroid", "st_union", "st_intersection", "st_difference",
     "st_convexhull", "st_transform", "st_simplify", "st_buffer",
-    "st_envelope", "st_collect", "st_pointonsurface",
-    # Accessors
+    "st_envelope", "st_collect", "st_pointonsurface", "st_snap",
+    "st_force2d", "st_multi",
+    # Output
     "st_x", "st_y", "st_astext", "st_asgeojson", "st_asbinary",
     "st_srid", "st_geometrytype", "st_numgeometries", "st_numpoints",
     "st_isvalid", "st_isempty", "st_dimension",
-    "st_minx", "st_maxx", "st_miny", "st_maxy",
     "geometrytype",
-    # Aggregate spatial
-    "st_collect",
-    # Standard SQL functions
+    # Aggregate spatial (st_extent excluded — returns SRID 0, breaks spatial ops)
+    "st_collect", "st_union",
+    # Cast helpers
+    "geography", "geometry",
+    # Standard SQL / PostgreSQL functions
     "count", "sum", "avg", "min", "max", "round", "coalesce",
     "lower", "upper", "trim", "cast", "nullif", "abs",
-    "group_concat", "total", "typeof", "length", "substr",
-    "replace", "instr", "hex", "quote", "printf",
-    "ifnull", "iif",
-    # SpatiaLite specific
-    "spatialite_version", "astext", "asgeojson", "asbinary",
-    "distance", "area", "centroid", "buffer",
-    # GeoPackage helpers
-    "castautomagic", "geomfromgpb", "enablegpkgamphibiousmode",
-    "gpb_isassignedtype", "gpb_gettype",
+    "concat", "length", "substr", "substring", "replace",
+    "to_char", "to_number", "greatest", "least",
+    "array_agg", "string_agg", "json_agg", "jsonb_agg",
 }
 
-# Patterns that indicate dangerous SQL
+# Table names the LLM sometimes hallucinates — never valid in our schema
+HALLUCINATED_TABLES = {
+    "boundary", "boundaries", "suburb", "suburbs", "area", "areas",
+    "place", "places", "location", "locations", "region", "regions",
+    "feature", "features", "layer", "layers",
+}
 FORBIDDEN_PATTERNS = [
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE)\b",
     r"\b(EXECUTE|EXEC)\b",
-    r"\bATTACH\b",
-    r"\bDETACH\b",
-    r"\bPRAGMA\b",
-    r"\bload_extension\b",
+    r"\bCOPY\b",
+    r"\bpg_read_file\b",
+    r"\bpg_ls_dir\b",
     r";\s*\S",  # Multiple statements (statement stacking)
+    r"\bST_Extent\b",  # Returns SRID 0 — use osm_boundaries subquery instead
 ]
 
 
@@ -108,13 +109,21 @@ class SQLValidator:
 
         stmt = parsed[0]
         stmt_type = stmt.get_type()
-        if stmt_type != "SELECT":
+        # sqlparse returns None for CTE queries (WITH ... SELECT) — treat as SELECT
+        if stmt_type not in ("SELECT", None):
             raise ValidationError(
                 f"Only SELECT statements are allowed, got: {stmt_type}"
             )
 
         # Step 4: Validate table references
         tables_used = self._extract_tables(sql)
+        hallucinated = tables_used & HALLUCINATED_TABLES
+        if hallucinated:
+            raise ValidationError(
+                f"Hallucinated table name(s) used: {hallucinated}. "
+                f"Use only osm_* tables. For suburb boundaries use osm_boundaries. "
+                f"Never use a CTE name as if it were a real table in FROM/JOIN outside the CTE body."
+            )
         unknown_tables = tables_used - self.allowed_tables
         if unknown_tables:
             raise ValidationError(
@@ -128,7 +137,7 @@ class SQLValidator:
         if unknown_funcs:
             raise ValidationError(
                 f"Unknown or disallowed function(s): {unknown_funcs}. "
-                f"Use only SpatiaLite spatial functions."
+                f"Use only PostGIS spatial functions."
             )
 
         # Step 6: Expand ORDER BY alias references to full expressions
@@ -152,21 +161,36 @@ class SQLValidator:
         """Remove markdown code fences and language hints."""
         sql = re.sub(r"^```(?:sql)?\s*", "", sql, flags=re.MULTILINE)
         sql = re.sub(r"```\s*$", "", sql, flags=re.MULTILINE)
-        # Also strip leading/trailing explanation text before/after SQL
-        # Look for SELECT to find where the SQL starts
-        match = re.search(r"(SELECT\b.+)", sql, re.IGNORECASE | re.DOTALL)
+        # Strip leading/trailing explanation text — find where the SQL starts.
+        # Must match WITH (CTEs) before SELECT, otherwise the WITH clause gets
+        # stripped and CTE queries arrive truncated (missing "WITH name AS (").
+        match = re.search(r"(\bWITH\b.+|\bSELECT\b.+)", sql, re.IGNORECASE | re.DOTALL)
         if match:
             sql = match.group(1)
         return sql.strip()
 
     def _extract_tables(self, sql: str) -> set[str]:
-        """Extract table names from FROM and JOIN clauses."""
-        # Match FROM table, JOIN table (with optional alias)
+        """Extract table names from FROM and JOIN clauses, excluding CTE names."""
+        # Collect CTE names first (WITH cte_name AS (...)) so we don't flag them
+        cte_names = {
+            m.lower()
+            for m in re.findall(r'\bWITH\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(', sql, re.IGNORECASE)
+        }
+        # Also catch subsequent CTE definitions: , cte_name AS (
+        cte_names |= {
+            m.lower()
+            for m in re.findall(r',\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(', sql, re.IGNORECASE)
+        }
+
+        # Match FROM table and JOIN table (with optional alias)
         pattern = r"(?:FROM|JOIN)\s+\"?([a-zA-Z_][a-zA-Z0-9_]*)\"?"
         matches = re.findall(pattern, sql, re.IGNORECASE)
-        # Filter out subquery keywords
+        # Filter out SQL keywords and CTE names
         skip = {"select", "where", "on", "and", "or", "not", "lateral"}
-        return {m.lower() for m in matches if m.lower() not in skip}
+        return {
+            m.lower() for m in matches
+            if m.lower() not in skip and m.lower() not in cte_names
+        }
 
     def _extract_functions(self, sql: str) -> set[str]:
         """Extract function call names from SQL."""

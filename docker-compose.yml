@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: geospatial-db:latest
+    container_name: geospatial_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: geospatial
+      POSTGRES_USER: geo
+      POSTGRES_PASSWORD: geo
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U geo -d geospatial"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  pgdata:
+    driver: local
