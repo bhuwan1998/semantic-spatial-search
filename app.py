@@ -29,6 +29,7 @@ from core.executor import execute_query
 from core.analyst import analyse, analyse_stream
 from core.geocoder import get_adelaide_center
 from core.graph import get_graph_context_for_query, get_graph_summary, graph_is_available
+from core.spatial_reasoner import decompose_intent
 
 load_dotenv()
 
@@ -176,7 +177,7 @@ def build_default_map_html(basemap: str, device_coords=None) -> str:
     return m._repr_html_()
 
 
-def build_map_html(gdf: gpd.GeoDataFrame, basemap: str, device_coords=None) -> str:
+def build_map_html(gdf: gpd.GeoDataFrame, basemap: str, device_coords=None, spatial_intent=None) -> str:
     m = _create_base_map(basemap)
     _add_location_marker(m, device_coords)
 
@@ -236,8 +237,97 @@ def build_map_html(gdf: gpd.GeoDataFrame, basemap: str, device_coords=None) -> s
                     },
                 ).add_to(m)
 
+    # ── Spatial reasoning overlays ────────────────────────────────────────────
+    if spatial_intent is not None:
+        _add_spatial_overlays(m, gdf, spatial_intent)
+
     folium.LayerControl(collapsed=False).add_to(m)
     return m._repr_html_()
+
+
+def _add_spatial_overlays(m: folium.Map, gdf, intent) -> None:
+    """Add proximity rings and directional annotations based on SpatialIntent."""
+    import math
+
+    # Compute centroid of results to use as reference for overlays
+    if gdf is None or gdf.empty:
+        return
+    try:
+        cx = float(gdf.geometry.centroid.x.mean())
+        cy = float(gdf.geometry.centroid.y.mean())
+    except Exception:
+        return
+
+    # Proximity rings — show if proximity intent detected
+    dist_m = getattr(intent, "explicit_distance_m", None)
+    has_fuzzy = getattr(intent, "has_fuzzy_proximity", False)
+    primary = getattr(intent, "primary_intent", "unknown")
+
+    if dist_m is not None and primary in (
+        "proximity_search", "nearest_neighbour", "gap_analysis"
+    ):
+        tier = getattr(intent, "proximity_tier", "")
+        folium.Circle(
+            location=[cy, cx],
+            radius=dist_m,
+            color="#f59e0b",
+            weight=2,
+            fill=True,
+            fill_color="#fbbf24",
+            fill_opacity=0.06,
+            tooltip=f"Search radius: {dist_m:,.0f} m ({tier})",
+            dash_array="6",
+        ).add_to(m)
+    elif has_fuzzy:
+        from core.spatial_concepts import DEFAULT_PROXIMITY_M
+        tier = getattr(intent, "proximity_tier", "nearby")
+        folium.Circle(
+            location=[cy, cx],
+            radius=DEFAULT_PROXIMITY_M,
+            color="#94a3b8",
+            weight=1,
+            fill=True,
+            fill_color="#cbd5e1",
+            fill_opacity=0.05,
+            tooltip=f"Fuzzy proximity: {DEFAULT_PROXIMITY_M:,} m ({tier})",
+            dash_array="4",
+        ).add_to(m)
+
+    # Directional arrow annotation — add a simple bearing label marker
+    directions = getattr(intent, "directions", [])
+    if directions:
+        _BEARING_MAP = {
+            "north": 0, "northeast": 45, "east": 90, "southeast": 135,
+            "south": 180, "southwest": 225, "west": 270, "northwest": 315,
+        }
+        _DIR_ARROW = {
+            "north": "↑", "northeast": "↗", "east": "→", "southeast": "↘",
+            "south": "↓", "southwest": "↙", "west": "←", "northwest": "↖",
+        }
+        for d in directions[:2]:  # show at most 2 directional indicators
+            bearing_deg = _BEARING_MAP.get(d)
+            arrow = _DIR_ARROW.get(d, "→")
+            if bearing_deg is None:
+                continue
+            # Place the label 1.5 km from the centroid in the given direction
+            offset_m = 1500
+            rad = math.radians(bearing_deg)
+            # Approximate degree offsets (1° lat ≈ 111 km, 1° lon ≈ 111*cos(lat) km)
+            dlat = (offset_m / 111_000) * math.cos(rad)
+            dlon = (offset_m / (111_000 * abs(math.cos(math.radians(cy))))) * math.sin(rad)
+            folium.Marker(
+                location=[cy + dlat, cx + dlon],
+                icon=folium.DivIcon(
+                    html=(
+                        f'<div style="font-size:20px;color:#f59e0b;'
+                        f'text-shadow:0 0 4px #000;font-weight:bold;">'
+                        f'{arrow} {d.title()}</div>'
+                    ),
+                    icon_size=(90, 28),
+                    icon_anchor=(45, 14),
+                ),
+                tooltip=f"Directional filter: {d} of reference",
+            ).add_to(m)
 
 
 # ─── device location helper ───────────────────────────────────────────────────
@@ -302,6 +392,7 @@ def _init_session():
         "messages":               [],    # list of chat message dicts
         "current_map_html":       None,  # latest map HTML
         "current_gdf":            None,  # latest GeoDataFrame for basemap rerender
+        "current_intent":         None,  # latest SpatialIntent for map overlays
         "basemap_selection":      "Dark (CartoDB Dark Matter)",
         "device_location":        None,
         "pending_location_query": None,
@@ -330,7 +421,7 @@ def run_pipeline(
     device_coords=None,
 ) -> dict:
     """
-    Full RAG → SQL → Execute → Analyse pipeline.
+    Full RAG → Spatial Reasoning → SQL → Execute → Analyse pipeline.
     Passes the last CONVERSATION_HISTORY_TURNS exchanges as context to the LLM
     so follow-up queries resolve references to prior results.
     Returns a result dict stored in messages.
@@ -339,14 +430,15 @@ def run_pipeline(
 
     ALWAYS_INCLUDE = {"osm_all", "osm_boundaries"}
 
-    # 1. RAG + graph context concurrently — both are independent of each other.
-    #    retrieve_cached() returns instantly if the query was prefetched or seen before.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        rag_future   = pool.submit(retrieve_cached, user_query)
-        graph_future = pool.submit(get_graph_context_for_query, user_query)
+    # 1. RAG + graph context + spatial intent decomposition — all independent.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        rag_future    = pool.submit(retrieve_cached, user_query)
+        graph_future  = pool.submit(get_graph_context_for_query, user_query)
+        intent_future = pool.submit(decompose_intent, user_query)
 
     relevant_tables = rag_future.result()
     graph_ctx       = graph_future.result()
+    intent          = intent_future.result()
 
     if relevant_tables:
         from core.schema import format_schema_for_llm as _fmt
@@ -366,7 +458,7 @@ def run_pipeline(
         st.session_state["messages"], CONVERSATION_HISTORY_TURNS
     )
 
-    # 3. Generate SQL
+    # 3. Generate SQL (with spatial intent context injected)
     sql, error = generate_sql(
         user_query=user_query,
         schema_context=rag_schema,
@@ -374,6 +466,7 @@ def run_pipeline(
         device_coords=device_coords,
         model=OLLAMA_MODEL,
         conversation_history=history,
+        spatial_intent_context=intent.llm_context if intent else None,
     )
 
     if error:
@@ -386,13 +479,14 @@ def run_pipeline(
         return {"role": "assistant", "error": result.error, "sql": sql}
 
     # 5. Analyse results (streaming — summary rendered live in _process_query)
-    analysis = analyse_stream(user_query, sql, result)
+    analysis = analyse_stream(user_query, sql, result, intent=intent)
 
-    # 6. Build map HTML
+    # 6. Build map HTML (with spatial reasoning overlays)
     basemap = st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)")
     if result.has_geometry and result.gdf is not None and not result.gdf.empty:
-        map_html = build_map_html(result.gdf, basemap, device_coords)
+        map_html = build_map_html(result.gdf, basemap, device_coords, spatial_intent=intent)
         st.session_state["current_gdf"] = result.gdf
+        st.session_state["current_intent"] = intent
     else:
         map_html = st.session_state.get("current_map_html") or build_default_map_html(
             basemap, device_coords
@@ -426,16 +520,17 @@ def run_pipeline(
         table_df = None
 
     return {
-        "role":      "assistant",
-        "summary":   analysis.summary,   # "" when streaming; filled by _process_query
-        "stats":     analysis.stats,
-        "followups": analysis.followups,
-        "sql":       sql,
-        "map_html":  map_html,
-        "table_df":  table_df,
-        "row_count": result.row_count,
-        "error":     None,
-        "_stream":   analysis.stream,    # generator or None; consumed once, then dropped
+        "role":           "assistant",
+        "summary":        analysis.summary,   # "" when streaming; filled by _process_query
+        "stats":          analysis.stats,
+        "followups":      analysis.followups,
+        "sql":            sql,
+        "map_html":       map_html,
+        "table_df":       table_df,
+        "row_count":      result.row_count,
+        "error":          None,
+        "_stream":        analysis.stream,    # generator or None; consumed once, then dropped
+        "spatial_intent": intent,             # SpatialIntent for reasoning trace UI
     }
 
 
@@ -474,6 +569,23 @@ def _render_assistant_message(msg: dict) -> None:
                 # Prettify label
                 pretty = label.replace("_", " ").title()
                 st.metric(pretty, display)
+
+    # Spatial reasoning trace panel
+    spatial_intent = msg.get("spatial_intent")
+    if spatial_intent is not None:
+        trace = spatial_intent.to_display_dict()
+        if trace:
+            with st.expander("Spatial Reasoning Trace", expanded=False):
+                source = trace.pop("Source", "rule-based")
+                badge_color = "#6366f1" if "llm" in source else "#64748b"
+                st.markdown(
+                    f'<span style="background:{badge_color};color:#fff;'
+                    f'padding:2px 8px;border-radius:4px;font-size:0.75rem;">'
+                    f'{source}</span>',
+                    unsafe_allow_html=True,
+                )
+                for key, val in trace.items():
+                    st.markdown(f"**{key}:** {val}")
 
     if msg.get("sql"):
         with st.expander("View SQL"):
@@ -619,24 +731,15 @@ def main():
                     _render_assistant_message(msg)
 
         # Chat input
-        # A hidden text_input mirrors what the user types so we can fire
-        # prefetch_async on every keystroke — by the time they hit Enter the
-        # RAG embed is already done or in-flight.
-        def _on_input_change():
-            draft = st.session_state.get("_chat_draft", "").strip()
-            if draft:
-                prefetch_async(draft)
-
-        st.text_input(
-            "draft",
-            key="_chat_draft",
-            on_change=_on_input_change,
-            label_visibility="collapsed",
-            placeholder="Ask a spatial question...",
-        )
-
+        # prefetch_async fires when the user submits — the embed is in-flight
+        # while the pipeline starts, so it usually completes before RAG needs it.
         pending    = st.session_state.pop("_pending_chat_input", None)
-        user_input = st.chat_input("Submit query", key="chat_input_box")
+        user_input = st.chat_input("Ask a spatial question...", key="chat_input_box")
+
+        # Fire prefetch as soon as we have the query text
+        if user_input:
+            prefetch_async(user_input.strip())
+
         query_to_run = pending or user_input
 
         if query_to_run and query_to_run.strip():
@@ -685,6 +788,7 @@ def main():
             st.session_state["current_map_html"] = build_map_html(
                 current_gdf, basemap,
                 device_coords=st.session_state.get("device_location"),
+                spatial_intent=st.session_state.get("current_intent"),
             )
 
         map_html = st.session_state.get("current_map_html") or build_default_map_html(

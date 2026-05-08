@@ -30,6 +30,11 @@ DEVICE_LOCATION_PATTERNS = [
 
 
 SYSTEM_PROMPT = """You are a PostGIS SQL query generator for a PostgreSQL database containing OpenStreetMap data for Adelaide, South Australia.
+You are equipped with semantic spatial reasoning — you understand proximity tiers (walking distance ≤800 m, nearby ≤3 km),
+directional relations (north/south/east/west via ST_Azimuth), topological relations (within, intersects, touches),
+and qualitative descriptors (large park → area > 50000 m², dense → many per km², walkable → ≤800 m).
+When a [SPATIAL REASONING CONTEXT] block is provided in the user message, USE it to select the correct PostGIS operators,
+distance thresholds, and query patterns.
 
 CRITICAL RULES:
 1. Output ONLY a valid PostGIS SELECT query. No markdown, no explanation, no backticks, no commentary.
@@ -778,6 +783,163 @@ FEW_SHOT_EXAMPLES = [
             "LIMIT 50;"
         )
     },
+    # Pattern 24: Directional query — north of a reference point using ST_Azimuth
+    {
+        "role": "user",
+        "content": "Show restaurants north of Adelaide CBD"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "WITH ref AS ("
+            "SELECT ST_Centroid(geometry) AS geom "
+            "FROM osm_all WHERE name ILIKE '%Adelaide CBD%' LIMIT 1"
+            ") "
+            "SELECT r.name, r.amenity, "
+            "ROUND(ST_Distance(r.geometry::geography, (SELECT geom FROM ref)::geography)) AS distance_m, "
+            "DEGREES(ST_Azimuth((SELECT geom FROM ref), ST_Centroid(r.geometry))) AS bearing_deg, "
+            "ST_AsGeoJSON(r.geometry) AS geojson "
+            "FROM osm_restaurants r, ref "
+            "WHERE r.geometry IS NOT NULL "
+            "AND ("
+            "DEGREES(ST_Azimuth(ref.geom, ST_Centroid(r.geometry))) <= 22.5 "
+            "OR DEGREES(ST_Azimuth(ref.geom, ST_Centroid(r.geometry))) >= 337.5"
+            ") "
+            "ORDER BY r.geometry <-> (SELECT geom FROM ref) "
+            "LIMIT 50;"
+        )
+    },
+    # Pattern 25: Large parks — qualitative size descriptor
+    {
+        "role": "user",
+        "content": "Show me large parks in Adelaide"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT name, leisure, "
+            "ROUND(ST_Area(geometry::geography)) AS area_m2, "
+            "ST_AsGeoJSON(geometry) AS geojson "
+            "FROM osm_parks "
+            "WHERE name IS NOT NULL "
+            "AND ST_Area(geometry::geography) > 50000 "
+            "ORDER BY ST_Area(geometry::geography) DESC "
+            "LIMIT 50;"
+        )
+    },
+    # Pattern 26: Walkable distance — fuzzy proximity qualifier
+    {
+        "role": "user",
+        "content": "Show schools within walking distance of Rundle Mall"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT s.name, "
+            "ROUND(ST_Distance(s.geometry::geography, "
+            "(SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%Rundle Mall%' LIMIT 1)::geography)) AS distance_m, "
+            "ST_AsGeoJSON(s.geometry) AS geojson "
+            "FROM osm_schools s "
+            "WHERE ST_DWithin("
+            "s.geometry::geography, "
+            "(SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%Rundle Mall%' LIMIT 1)::geography, "
+            "800) "
+            "ORDER BY s.geometry <-> (SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%Rundle Mall%' LIMIT 1) "
+            "LIMIT 50;"
+        )
+    },
+    # Pattern 27: Dense suburb — qualitative density with per-km² ranking
+    {
+        "role": "user",
+        "content": "Which suburbs have the densest concentration of cafes?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT b.name AS suburb, "
+            "COUNT(r.id) AS cafe_count, "
+            "ROUND(ST_Area(b.geometry::geography) / 1000000.0, 4) AS area_km2, "
+            "ROUND((COUNT(r.id) / (ST_Area(b.geometry::geography) / 1000000.0))::numeric, 2) AS cafes_per_km2, "
+            "ST_AsGeoJSON(b.geometry) AS geojson "
+            "FROM osm_boundaries b "
+            "LEFT JOIN osm_restaurants r ON ST_Within(r.geometry, b.geometry) AND r.amenity = 'cafe' "
+            "WHERE b.admin_level = '9' "
+            "GROUP BY b.id, b.name, b.geometry "
+            "HAVING COUNT(r.id) > 0 "
+            "ORDER BY cafes_per_km2 DESC "
+            "LIMIT 20;"
+        )
+    },
+    # Pattern 28: Directional — east of a suburb
+    {
+        "role": "user",
+        "content": "Show parks east of Norwood"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "WITH ref AS ("
+            "SELECT ST_Centroid(geometry) AS geom "
+            "FROM osm_boundaries WHERE name ILIKE '%Norwood%' ORDER BY admin_level DESC LIMIT 1"
+            ") "
+            "SELECT p.name, "
+            "ROUND(ST_Distance(p.geometry::geography, (SELECT geom FROM ref)::geography)) AS distance_m, "
+            "DEGREES(ST_Azimuth((SELECT geom FROM ref), ST_Centroid(p.geometry))) AS bearing_deg, "
+            "ST_AsGeoJSON(p.geometry) AS geojson "
+            "FROM osm_parks p, ref "
+            "WHERE p.geometry IS NOT NULL "
+            "AND DEGREES(ST_Azimuth(ref.geom, ST_Centroid(p.geometry))) BETWEEN 67.5 AND 112.5 "
+            "ORDER BY p.geometry <-> (SELECT geom FROM ref) "
+            "LIMIT 50;"
+        )
+    },
+    # Pattern 29: Isolated features — qualitative 'isolated' descriptor
+    {
+        "role": "user",
+        "content": "Which pharmacies are most isolated from hospitals?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT p.name AS pharmacy, "
+            "ROUND(MIN(ST_Distance(p.geometry::geography, h.geometry::geography))) AS nearest_hospital_m, "
+            "ST_AsGeoJSON(p.geometry) AS geojson "
+            "FROM osm_pharmacies p "
+            "CROSS JOIN osm_hospitals h "
+            "WHERE p.name IS NOT NULL "
+            "GROUP BY p.id, p.name, p.geometry "
+            "ORDER BY nearest_hospital_m DESC "
+            "LIMIT 20;"
+        )
+    },
+    # Pattern 30: Spatial reasoning context injection — example with context block
+    {
+        "role": "user",
+        "content": (
+            "[SPATIAL REASONING CONTEXT]\n"
+            "Intent: proximity search\n"
+            "Distance: 1,500 m (short walk — short walk or cycling distance ≤1.5 km)\n"
+            "Recommended PostGIS operators: ST_DWithin(a::geography, b::geography, 1500)\n"
+            "[/SPATIAL REASONING CONTEXT]\n"
+            "Show restaurants within a short walk of Glenelg Beach"
+        )
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT r.name, r.amenity, r.cuisine, "
+            "ROUND(ST_Distance(r.geometry::geography, "
+            "(SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%Glenelg%' LIMIT 1)::geography)) AS distance_m, "
+            "ST_AsGeoJSON(r.geometry) AS geojson "
+            "FROM osm_restaurants r "
+            "WHERE ST_DWithin("
+            "r.geometry::geography, "
+            "(SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%Glenelg%' LIMIT 1)::geography, "
+            "1500) "
+            "ORDER BY r.geometry <-> (SELECT ST_Centroid(geometry) FROM osm_all WHERE name ILIKE '%Glenelg%' LIMIT 1) "
+            "LIMIT 100;"
+        )
+    },
 ]
 
 
@@ -816,6 +978,7 @@ def generate_sql(
     model: str | None = None,
     max_retries: int = 3,
     conversation_history: list[dict] | None = None,
+    spatial_intent_context: str | None = None,
 ) -> tuple[str, str | None]:
     """
     Generate a validated PostGIS SQL query from natural language.
@@ -825,6 +988,8 @@ def generate_sql(
     conversation_history is a list of prior {"role": "user"|"assistant", "content": str}
     turns injected between few-shots and the current query so the LLM can resolve
     follow-up references ("those", "same area", "now filter by...").
+    spatial_intent_context is an optional [SPATIAL REASONING CONTEXT] block produced
+    by SpatialReasoner.decompose_intent() that provides operator hints to the LLM.
 
     Returns (sql, error). If successful, error is None.
     """
@@ -844,11 +1009,16 @@ def generate_sql(
     if device_coords is not None:
         system_content += _build_device_location_context(device_coords)
 
+    # Build user query message — prepend spatial reasoning context if available
+    user_message_content = user_query
+    if spatial_intent_context:
+        user_message_content = spatial_intent_context + "\n" + user_query
+
     messages = [
         {"role": "system", "content": system_content},
         *FEW_SHOT_EXAMPLES,
         *(conversation_history or []),
-        {"role": "user", "content": user_query},
+        {"role": "user", "content": user_message_content},
     ]
 
     last_error = None
@@ -939,6 +1109,7 @@ def generate_analysis_stream(
     sql: str,
     stats: dict,
     model: str | None = None,
+    spatial_prompt: str | None = None,
 ):
     """
     Streaming variant of generate_analysis().
@@ -946,6 +1117,9 @@ def generate_analysis_stream(
     Yields text chunks as they arrive from the LLM so callers can use
     st.write_stream() for perceived latency improvement.  Falls back to
     yielding the full string at once if the model/path doesn't support streaming.
+
+    spatial_prompt: optional pre-built prompt from SpatialReasoner.explain_results()
+    that provides richer spatial context.  When provided it replaces the default prompt.
     """
     analysis_model = os.getenv("ANALYSIS_MODEL", "").strip()
     analysis_key   = os.getenv("ANALYSIS_API_KEY", "").strip()
@@ -956,18 +1130,22 @@ def generate_analysis_stream(
     extra_stats  = {k: v for k, v in stats.items()
                     if k not in ("count", "geometry_types", "sample_names")}
 
-    prompt = (
-        f"User asked: \"{user_query}\"\n"
-        f"SQL executed: {sql}\n"
-        f"Results: {count} features returned.\n"
-        f"Geometry types: {geom_types}\n"
-        f"Sample names: {', '.join(str(n) for n in sample_names[:5]) or 'N/A'}\n"
-        f"Statistics: {extra_stats}\n\n"
-        f"Provide:\n"
-        f"1. A 2-3 sentence spatial interpretation of what was found and why it matters.\n"
-        f"2. Any notable patterns, clusters, or distributions visible in the data.\n"
-        f"Be concise and factual."
-    )
+    # Use the enriched spatial prompt if provided, else fall back to the default
+    if spatial_prompt:
+        prompt = spatial_prompt
+    else:
+        prompt = (
+            f"User asked: \"{user_query}\"\n"
+            f"SQL executed: {sql}\n"
+            f"Results: {count} features returned.\n"
+            f"Geometry types: {geom_types}\n"
+            f"Sample names: {', '.join(str(n) for n in sample_names[:5]) or 'N/A'}\n"
+            f"Statistics: {extra_stats}\n\n"
+            f"Provide:\n"
+            f"1. A 2-3 sentence spatial interpretation of what was found and why it matters.\n"
+            f"2. Any notable patterns, clusters, or distributions visible in the data.\n"
+            f"Be concise and factual."
+        )
 
     if analysis_model and analysis_key:
         try:
@@ -1039,12 +1217,14 @@ def generate_analysis(
     sql: str,
     stats: dict,
     model: str | None = None,
+    spatial_prompt: str | None = None,
 ) -> str:
     """
     Call the analysis LLM to produce a natural language spatial summary.
 
     Uses ANALYSIS_MODEL env var if set, otherwise falls back to OLLAMA_MODEL.
     Returns a plain text paragraph. Returns empty string on failure.
+    spatial_prompt: optional pre-built prompt from SpatialReasoner.explain_results().
     """
     analysis_model = os.getenv("ANALYSIS_MODEL", "").strip()
     analysis_key   = os.getenv("ANALYSIS_API_KEY", "").strip()
@@ -1055,18 +1235,21 @@ def generate_analysis(
     extra_stats  = {k: v for k, v in stats.items()
                     if k not in ("count", "geometry_types", "sample_names")}
 
-    prompt = (
-        f"User asked: \"{user_query}\"\n"
-        f"SQL executed: {sql}\n"
-        f"Results: {count} features returned.\n"
-        f"Geometry types: {geom_types}\n"
-        f"Sample names: {', '.join(str(n) for n in sample_names[:5]) or 'N/A'}\n"
-        f"Statistics: {extra_stats}\n\n"
-        f"Provide:\n"
-        f"1. A 2-3 sentence spatial interpretation of what was found and why it matters.\n"
-        f"2. Any notable patterns, clusters, or distributions visible in the data.\n"
-        f"Be concise and factual."
-    )
+    if spatial_prompt:
+        prompt = spatial_prompt
+    else:
+        prompt = (
+            f"User asked: \"{user_query}\"\n"
+            f"SQL executed: {sql}\n"
+            f"Results: {count} features returned.\n"
+            f"Geometry types: {geom_types}\n"
+            f"Sample names: {', '.join(str(n) for n in sample_names[:5]) or 'N/A'}\n"
+            f"Statistics: {extra_stats}\n\n"
+            f"Provide:\n"
+            f"1. A 2-3 sentence spatial interpretation of what was found and why it matters.\n"
+            f"2. Any notable patterns, clusters, or distributions visible in the data.\n"
+            f"Be concise and factual."
+        )
 
     if analysis_model and analysis_key:
         # Cloud LLM via OpenAI-compatible API (e.g. openai/gpt-4o)

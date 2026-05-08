@@ -22,6 +22,8 @@
    - [analyst.py — Spatial Analysis Agent](#67-analystpy--spatial-analysis-agent)
    - [graph.py — Apache AGE Interface](#68-graphpy--apache-age-interface)
    - [geocoder.py — Map Centering](#69-geocoderpy--map-centering)
+   - [spatial_concepts.py — Spatial Ontology](#610-spatial_conceptspy--spatial-ontology)
+   - [spatial_reasoner.py — Semantic Reasoning Layer](#611-spatial_reasonerpy--semantic-reasoning-layer)
 7. [Application Layer (`app.py`)](#7-application-layer-apppy)
 8. [End-to-End Request Flow](#8-end-to-end-request-flow)
 9. [Key Design Decisions](#9-key-design-decisions)
@@ -686,6 +688,157 @@ Used **only** for the default Folium map center on startup. All place name resol
 
 ---
 
+### 6.10 `spatial_concepts.py` — Spatial Ontology
+
+Defines the complete vocabulary for semantic spatial reasoning. No LLM required — pure Python dataclasses and dictionaries.
+
+| Concept class | Contents | Example |
+|---|---|---|
+| `ProximityTier` | Named distance bands with labels and descriptions | walking distance ≤800 m, nearby ≤3 km |
+| `SizeThreshold` | Park/polygon size categories with m² bounds | large > 50,000 m² |
+| `DirectionalRelation` | 8-direction bearing ranges + PostGIS hint | north: azimuth < 22.5° or > 337.5° |
+| `TOPOLOGICAL_RELATIONS` | Keyword lists → PostGIS operator strings | "within" → `ST_Within` |
+| `QUALITATIVE_DESCRIPTORS` | Fuzzy adjectives → quantitative thresholds | "walkable" → dist_m=800 |
+| `IntentType` | Taxonomy of spatial query types | proximity_search, gap_analysis, density_ranking… |
+
+**Key functions:**
+
+- `classify_intent(text)` — returns ordered list of detected `IntentType` keys
+- `detect_directions(text)` — cardinal/ordinal direction keywords → direction names
+- `detect_topological_relations(text)` — topological relation keywords detected
+- `detect_qualitative_descriptors(text)` — qualitative adjectives detected
+- `classify_proximity(distance_m)` → `ProximityTier`
+
+---
+
+### 6.11 `spatial_reasoner.py` — Semantic Reasoning Layer
+
+The **central addition** for semantic spatial reasoning. Runs in two phases:
+
+#### Pre-query: `decompose_intent(query, use_llm=True)`
+
+Runs concurrently with RAG retrieval and graph context fetching. Returns a `SpatialIntent` dataclass.
+
+**Two-pass decomposition:**
+
+1. **Rule-based pass** (always, ~0 ms) — uses `spatial_concepts.py` keyword matching:
+   - Classify primary and secondary intents
+   - Detect topological relations, directions, qualitative descriptors
+   - Extract explicit distances from text ("2km", "500 metres")
+   - Resolve qualitative proximity ("walking distance" → 800 m)
+   - Identify named places and feature types
+
+2. **LLM-enhanced pass** (optional, ~200 ms) — short Ollama call with a structured JSON prompt:
+   - Produces the same fields as rule-based, but with semantic understanding
+   - Merged _over_ the rule-based baseline (LLM wins on non-empty fields)
+   - Gracefully degrades if Ollama is unavailable
+
+**`SpatialIntent` fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `primary_intent` | str | Top-level intent type (e.g. `proximity_search`) |
+| `secondary_intents` | list[str] | Additional intents detected |
+| `topological_relations` | list[str] | Spatial operators needed |
+| `directions` | list[str] | Directional constraints (north, east…) |
+| `qualitative_descriptors` | list[str] | Fuzzy adjectives (large, dense, walkable…) |
+| `explicit_distance_m` | float\|None | Metres extracted from text or qualitative tier |
+| `proximity_tier` | str\|None | Human label for the distance |
+| `named_places` | list[str] | Proper nouns found |
+| `feature_types` | list[str] | OSM feature types mentioned |
+| `postgis_hints` | list[str] | Recommended PostGIS operator expressions |
+| `reasoning_notes` | list[str] | Short observations about the spatial challenge |
+| `llm_context` | str | `[SPATIAL REASONING CONTEXT]` block for SQL gen prompt |
+| `source` | str | `"rule-based"` or `"llm-enhanced"` |
+
+**`llm_context` injection:** The context block is prepended to the user query before being passed to `generate_sql()`. The SQL-generation LLM uses it to select correct operators, thresholds, and patterns.
+
+#### Post-query: `explain_results(intent, stats, user_query)`
+
+Builds an enriched analysis prompt (instead of the generic one) that:
+- Names the intent type explicitly
+- References topological relations used
+- Mentions directional constraints and asks whether results cluster in that direction
+- Includes qualitative context and asks the LLM to interpret it against actual data
+- Provides distance range interpretation with proximity tier labels
+
+Used by `analyst.py` → `generate_analysis_stream()`.
+
+#### UI: Reasoning Trace Panel
+
+After each query result, a collapsible **"Spatial Reasoning Trace"** expander shows:
+- Intent type and secondary intents
+- Spatial operators selected
+- Directional/qualitative context with thresholds
+- Distance and proximity tier
+- Named places extracted
+- PostGIS hints derived
+- Source badge (rule-based / llm-enhanced)
+
+#### Map: Spatial Overlays
+
+When spatial intent is available, `build_map_html()` adds:
+- **Proximity ring** — dashed circle at the search radius centred on the result centroid (amber for explicit distance, grey for fuzzy)
+- **Directional arrows** — bearing labels (↑ North, → East, etc.) placed 1.5 km from the centroid in each detected direction
+
+#### Spatial Reasoner Two-Pass Decomposition
+
+```mermaid
+flowchart TD
+    Q([user_query]) --> RB
+
+    subgraph RB["Pass 1 — Rule-Based (~0 ms)"]
+        direction TB
+        RB1[classify_intent] --> RB2[detect_topological_relations]
+        RB2 --> RB3[detect_directions]
+        RB3 --> RB4[detect_qualitative_descriptors]
+        RB4 --> RB5[extract explicit distance regex]
+        RB5 --> RB6[resolve qualitative proximity\ne.g. walking distance → 800 m]
+        RB6 --> RB7[identify named_places & feature_types]
+    end
+
+    RB7 --> BASE[SpatialIntent baseline]
+
+    BASE --> LLM_CHECK{use_llm=True\n& Ollama reachable?}
+    LLM_CHECK -- No --> OUT
+    LLM_CHECK -- Yes --> LLM
+
+    subgraph LLM["Pass 2 — LLM-Enhanced (~200 ms)"]
+        direction TB
+        L1[structured JSON prompt\n~350 tokens] --> L2[Ollama call\nsmall fast model]
+        L2 --> L3[parse JSON response]
+        L3 --> L4[merge over baseline\nLLM wins on non-empty fields]
+    end
+
+    L4 --> OUT([SpatialIntent\nsource = rule-based OR llm-enhanced])
+
+    OUT --> CTX[_build_llm_context\n→ SPATIAL REASONING CONTEXT block]
+    CTX --> SQL_GEN[prepended to user query\nin generate_sql]
+```
+
+#### Map Overlay Decision Logic
+
+```mermaid
+flowchart TD
+    SI([spatial_intent]) --> HG{has_geometry\nin result?}
+    HG -- No --> SKIP([no overlays])
+    HG -- Yes --> CENT[compute centroid of result GeoDataFrame]
+
+    CENT --> RD{explicit_distance_m\nset?}
+    RD -- Yes --> RING_AMBER[draw amber dashed circle\nat explicit_distance_m]
+    RD -- No --> RD2{proximity_tier set?}
+    RD2 -- Yes --> RING_GREY[draw grey dashed circle\nat tier.distance_m]
+    RD2 -- No --> NO_RING[no ring]
+
+    CENT --> DIR{directions list\nnon-empty?}
+    DIR -- Yes --> ARROWS[for each direction:\nplace bearing label\n1.5 km from centroid]
+    DIR -- No --> NO_ARROW[no arrows]
+
+    RING_AMBER & RING_GREY & NO_RING & ARROWS & NO_ARROW --> MAP([updated Folium map])
+```
+
+---
+
 ## 7. Application Layer (`app.py`)
 
 ### 7.1 Session State
@@ -778,6 +931,40 @@ Colour scheme:
 
 ## 8. End-to-End Request Flow
 
+### 8.1 High-Level Pipeline (Mermaid)
+
+```mermaid
+flowchart TD
+    U([User submits query]) --> DL{requires\ndevice location?}
+    DL -- Yes --> GPS[get_device_location\nbrowser JS geolocation] --> PP
+    DL -- No --> PP
+
+    PP[run_pipeline] --> PAR
+
+    subgraph PAR["Parallel fetch — ThreadPoolExecutor (3 workers)"]
+        direction LR
+        F1[retrieve_cached\nRAG embed + pgvector]
+        F2[get_graph_context_for_query\nAGE Cypher summary]
+        F3[decompose_intent\nrule-based + optional LLM]
+    end
+
+    PAR --> SCHEMA[format_schema_for_llm\ntop-4 tables + always-include]
+    SCHEMA --> CTX[prepend SpatialIntent\nllm_context block to query]
+    CTX --> SQL[generate_sql\nOllama: SYSTEM + 23 few-shots\n+ history + query]
+    SQL --> VAL[SQLValidator.validate\n8-step safety + sanitise]
+    VAL -- ValidationError --> SQL
+    VAL -- ok --> EXEC[execute_query\npsycopg3 → PostGIS]
+    EXEC --> GDF{geometry\nin result?}
+    GDF -- Yes --> GEO[GeoDataFrame\nEPSG:4326]
+    GDF -- No --> RAW[raw_rows list]
+    GEO & RAW --> ANA[analyse_stream\n_compute_stats\n+ should_skip_analysis?]
+    ANA --> MAP[build_map_html\nFolium + spatial overlays]
+    MAP --> RENDER[stream analysis tokens\nrender map + data table\nreasoning trace expander]
+    RENDER --> DONE([session updated, st.rerun])
+```
+
+### 8.2 Detailed Step-by-Step (ASCII)
+
 ```
 User types query in text_input (draft)
        │
@@ -850,6 +1037,23 @@ User hits Enter / clicks chat_input Submit
        │
        └─[6] st.rerun()
               → UI rerenders with new message + map visible
+```
+
+### 8.3 SpatialIntent Data Flow
+
+```mermaid
+flowchart LR
+    Q([user_query]) --> DR[decompose_intent]
+    DR --> SI[SpatialIntent]
+
+    SI -->|llm_context string| SQL_GEN[generate_sql\nprepended to user msg]
+    SI -->|intent object| ANA[analyse_stream\nenriched analysis prompt]
+    SI -->|explicit_distance_m\ndirections| MAP[build_map_html\nproximity ring + arrows]
+    SI -->|all fields| UI[Reasoning Trace\ncollapsible expander]
+
+    SQL_GEN --> EXEC[execute_query]
+    EXEC --> ANA
+    EXEC --> MAP
 ```
 
 ### UNION ALL response handling
