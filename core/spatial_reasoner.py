@@ -48,6 +48,7 @@ from core.spatial_concepts import (
     DIRECTION_KEYWORDS,
     POSTGIS_GLOSSARY,
     PROXIMITY_TIERS,
+    GRAPH_INTENT_TYPES,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,10 @@ class SpatialIntent:
     # Whether rule-based or LLM-enhanced decomposition was used
     source: str = "rule-based"   # "rule-based" | "llm-enhanced"
 
+    # Whether this query should be routed to the Cypher engine instead of SQL.
+    # Set to True when primary_intent is in GRAPH_INTENT_TYPES.
+    requires_graph: bool = False
+
     def to_display_dict(self) -> dict:
         """Return a UI-friendly dict for the reasoning trace panel."""
         d: dict = {}
@@ -138,6 +143,7 @@ class SpatialIntent:
             d["PostGIS hints"] = " | ".join(self.postgis_hints)
         if self.reasoning_notes:
             d["Notes"] = " · ".join(self.reasoning_notes)
+        d["Engine"] = "Apache AGE (Cypher)" if self.requires_graph else "PostGIS (SQL)"
         d["Source"] = self.source
         return d
 
@@ -251,7 +257,7 @@ You are a spatial reasoning assistant. Given a natural-language geospatial query
 decompose it into a structured JSON object with EXACTLY these keys:
 
 {
-  "primary_intent": "<one of: proximity_search | containment_query | directional_query | gap_analysis | density_ranking | comparison | attribute_filter | aggregate_stats | nearest_neighbour | topological_join | mixed | unknown>",
+  "primary_intent": "<one of: proximity_search | containment_query | directional_query | gap_analysis | density_ranking | comparison | attribute_filter | aggregate_stats | nearest_neighbour | topological_join | graph_traversal | path_query | cluster_pattern | mixed | unknown>",
   "secondary_intents": ["<intent>", ...],
   "topological_relations": ["<within|contains|intersects|touches|proximity|gap_analysis>", ...],
   "directions": ["<north|south|east|west|northeast|northwest|southeast|southwest>", ...],
@@ -261,6 +267,11 @@ decompose it into a structured JSON object with EXACTLY these keys:
   "feature_types": ["<school|hospital|restaurant|pharmacy|park|road|waterway|railway|building|landuse|boundary>", ...],
   "reasoning_notes": ["<short reasoning observation>", ...]
 }
+
+Intent guide for graph-engine intents:
+  graph_traversal : multi-hop reachability via NEAR edges (e.g. "reachable in 2 hops", "connected via", "transitively")
+  path_query      : shortest path between two named features (e.g. "shortest path between X and Y")
+  cluster_pattern : subgraph where multiple features are mutually near (e.g. "cluster of school, hospital and park")
 
 Rules:
 - Output ONLY valid JSON. No markdown, no explanation.
@@ -373,6 +384,13 @@ def decompose_intent(
         notes.append("Density query: normalise by suburb area in km²")
     if primary == "comparison":
         notes.append("Comparison query: UNION ALL pattern with summary stat rows")
+    if primary in GRAPH_INTENT_TYPES:
+        notes.append(
+            f"Graph-engine query ({primary.replace('_', ' ')}) — "
+            "will be executed as Cypher against Apache AGE, not PostGIS SQL."
+        )
+
+    requires_graph = primary in GRAPH_INTENT_TYPES
 
     intent = SpatialIntent(
         primary_intent=primary,
@@ -389,6 +407,7 @@ def decompose_intent(
         has_fuzzy_proximity=has_fuzzy,
         reasoning_notes=notes,
         source="rule-based",
+        requires_graph=requires_graph,
     )
     intent.postgis_hints = _build_postgis_hints(intent)
 
@@ -434,6 +453,8 @@ def decompose_intent(
                 )
             intent.postgis_hints = _build_postgis_hints(intent)
             intent.source = "llm-enhanced"
+            # Re-evaluate graph routing after LLM may have updated primary_intent
+            intent.requires_graph = intent.primary_intent in GRAPH_INTENT_TYPES
 
     # ── Build LLM context string ──────────────────────────────────────────────
     intent.llm_context = _build_llm_context(intent)
@@ -480,6 +501,12 @@ def _build_llm_context(intent: SpatialIntent) -> str:
 
     if intent.postgis_hints:
         lines.append("Recommended PostGIS operators: " + " | ".join(intent.postgis_hints))
+
+    if intent.requires_graph:
+        lines.append(
+            "Engine: Apache AGE Cypher (graph traversal) — "
+            "query will NOT use PostGIS SQL."
+        )
 
     if intent.reasoning_notes:
         lines.append("Notes: " + " · ".join(intent.reasoning_notes))

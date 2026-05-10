@@ -940,6 +940,45 @@ FEW_SHOT_EXAMPLES = [
             "LIMIT 100;"
         )
     },
+    # Pattern 31: Road segment aggregation — roads are stored as individual segments,
+    # so 'longest road' requires GROUP BY name + ST_LineMerge(ST_Collect(geometry)).
+    {
+        "role": "user",
+        "content": "What is the longest road in Adelaide?"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT name, "
+            "COUNT(*) AS segment_count, "
+            "ROUND(ST_Length(ST_LineMerge(ST_Collect(geometry))::geography)) AS total_length_m, "
+            "ST_AsGeoJSON(ST_LineMerge(ST_Collect(geometry))) AS geojson "
+            "FROM osm_roads "
+            "WHERE name IS NOT NULL "
+            "GROUP BY name "
+            "ORDER BY total_length_m DESC "
+            "LIMIT 20;"
+        )
+    },
+    # Pattern 32: Road segment aggregation — highway type filter
+    {
+        "role": "user",
+        "content": "Show the longest primary roads by total length"
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "SELECT name, highway, "
+            "COUNT(*) AS segment_count, "
+            "ROUND(ST_Length(ST_LineMerge(ST_Collect(geometry))::geography)) AS total_length_m, "
+            "ST_AsGeoJSON(ST_LineMerge(ST_Collect(geometry))) AS geojson "
+            "FROM osm_roads "
+            "WHERE highway = 'primary' AND name IS NOT NULL "
+            "GROUP BY name, highway "
+            "ORDER BY total_length_m DESC "
+            "LIMIT 20;"
+        )
+    },
 ]
 
 
@@ -1021,9 +1060,31 @@ def generate_sql(
         {"role": "user", "content": user_message_content},
     ]
 
+    # Minimal 2-example few-shot list used on retry attempts to free context space
+    # for error feedback messages appended during the retry loop.
+    _RETRY_FEW_SHOTS = [
+        FEW_SHOT_EXAMPLES[0],  # Pattern 1: nearest N (osm_all subquery)
+        FEW_SHOT_EXAMPLES[1],
+        FEW_SHOT_EXAMPLES[2],  # Pattern 2: radius search
+        FEW_SHOT_EXAMPLES[3],
+    ]
+
     last_error = None
 
     for attempt in range(max_retries):
+        # On retry, rebuild messages with slim few-shots to make room for error feedback.
+        if attempt > 0:
+            messages = [
+                {"role": "system", "content": system_content},
+                *_RETRY_FEW_SHOTS,
+                *(conversation_history or []),
+                {"role": "user", "content": user_message_content},
+                # Re-append the accumulated correction turns from the previous attempt.
+                *messages[
+                    1 + len(FEW_SHOT_EXAMPLES) + len(conversation_history or []) + 1:
+                ],
+            ]
+
         try:
             ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
             client = ollama.Client(host=ollama_host)
@@ -1034,7 +1095,7 @@ def generate_sql(
                     "temperature": 0,
                     "seed": 42 + attempt,
                     "num_predict": 1024,
-                    "num_ctx": 8192,
+                    "num_ctx": 32768,
                 },
                 stream=False,
             )

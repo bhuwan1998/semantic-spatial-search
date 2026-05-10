@@ -27,9 +27,10 @@ from core.rag import HybridRAG, retrieve_cached, prefetch, prefetch_async
 from core.llm import generate_sql, query_requires_device_location
 from core.executor import execute_query
 from core.analyst import analyse, analyse_stream
-from core.geocoder import get_adelaide_center
 from core.graph import get_graph_context_for_query, get_graph_summary, graph_is_available
 from core.spatial_reasoner import decompose_intent
+from core.cypher_generator import generate_cypher
+from core.cypher_executor import execute_cypher
 
 load_dotenv()
 
@@ -94,6 +95,12 @@ EXAMPLE_QUERIES = [
     "Show parks near the River Torrens",
     "Which suburbs have the most schools?",
     "For each hospital, show the nearest pharmacy",
+    # Graph-traversal queries (routed to Cypher / Apache AGE)
+    "Find all amenities reachable in 2 hops from schools in the Adelaide CBD",
+    "What is the shortest path between a school and a pharmacy via NEAR edges?",
+    "Find clusters where a school, hospital and park are all mutually near each other",
+    "Which suburbs are connected to Norwood via shared features?",
+    "Show restaurants reachable from parks via NEAR graph edges",
 ]
 
 # ─── page config ──────────────────────────────────────────────────────────────
@@ -122,17 +129,20 @@ def load_schema():
 
 # ─── map helpers ──────────────────────────────────────────────────────────────
 
-# Bounding box for South Australia — map cannot be panned/zoomed outside this
+# Adelaide city viewport — default view locked to Adelaide CBD at zoom 12
+ADELAIDE_CENTER = (-34.9285, 138.6007)
+ADELAIDE_DEFAULT_ZOOM = 12
+
+# Hard bounding box for South Australia — prevents panning/zooming outside SA
 SA_BOUNDS = [[-38.5, 128.0], [-26.0, 141.0]]  # [[south, west], [north, east]]
 SA_MIN_ZOOM = 7
 SA_MAX_ZOOM = 18
 
 def _create_base_map(basemap_name: str) -> folium.Map:
-    center = get_adelaide_center()
     tiles_arg = BASEMAP_OPTIONS.get(basemap_name, "CartoDB dark_matter")
     m = folium.Map(
-        location=list(center),
-        zoom_start=12,
+        location=list(ADELAIDE_CENTER),
+        zoom_start=ADELAIDE_DEFAULT_ZOOM,
         tiles=None,
         min_zoom=SA_MIN_ZOOM,
         max_zoom=SA_MAX_ZOOM,
@@ -146,8 +156,9 @@ def _create_base_map(basemap_name: str) -> folium.Map:
     for name, tiles in BASEMAP_OPTIONS.items():
         if name != basemap_name:
             folium.TileLayer(tiles=tiles, name=name).add_to(m)
-    # Enforce the SA bounding box so the user cannot pan outside
-    m.fit_bounds(SA_BOUNDS)
+    # NOTE: do NOT call m.fit_bounds(SA_BOUNDS) here — that would zoom out to
+    # all of South Australia on every render. The SA bounds are enforced via
+    # max_bounds=True and the min/max lat/lon parameters above (pan restriction).
     return m
 
 
@@ -228,6 +239,7 @@ def build_map_html(gdf: gpd.GeoDataFrame, basemap: str, device_coords=None, spat
                 folium.GeoJson(
                     geom.__geo_interface__,
                     style_function=lambda x, c=color: {"color": c, "weight": 3, "opacity": 0.8},
+                    popup=folium.Popup(popup_html, max_width=300),
                 ).add_to(m)
             elif gtype in ("Polygon", "MultiPolygon"):
                 folium.GeoJson(
@@ -235,6 +247,7 @@ def build_map_html(gdf: gpd.GeoDataFrame, basemap: str, device_coords=None, spat
                     style_function=lambda x, c=color: {
                         "color": c, "weight": 2, "fillColor": c, "fillOpacity": 0.3,
                     },
+                    popup=folium.Popup(popup_html, max_width=300),
                 ).add_to(m)
 
     # ── Spatial reasoning overlays ────────────────────────────────────────────
@@ -253,8 +266,16 @@ def _add_spatial_overlays(m: folium.Map, gdf, intent) -> None:
     if gdf is None or gdf.empty:
         return
     try:
-        cx = float(gdf.geometry.centroid.x.mean())
-        cy = float(gdf.geometry.centroid.y.mean())
+        # Project to a metre-based CRS before computing centroid to avoid the
+        # "Geometry is in a geographic CRS" warning and get accurate coordinates.
+        # EPSG:7854 = GDA2020 / MGA zone 54 — covers Adelaide.
+        projected = gdf.to_crs(epsg=7854)
+        centroid_proj = projected.geometry.centroid
+        # Convert centroid back to WGS84 for Folium (which expects lon/lat degrees)
+        import geopandas as _gpd
+        centroid_wgs = _gpd.GeoSeries(centroid_proj, crs=7854).to_crs(epsg=4326)
+        cx = float(centroid_wgs.x.mean())
+        cy = float(centroid_wgs.y.mean())
     except Exception:
         return
 
@@ -411,6 +432,80 @@ def _init_session():
         st.session_state["rag_prefetched"] = True
 
 
+# ─── cypher pipeline (graph-traversal queries) ────────────────────────────────
+
+def _run_cypher_pipeline(
+    user_query: str,
+    intent,
+    all_tables,
+    device_coords=None,
+) -> dict:
+    """
+    Execute a graph-traversal query via Cypher → AGE → PostGIS geometry join.
+
+    Called by run_pipeline when intent.requires_graph is True and the AGE graph
+    is available.  Falls back to the SQL pipeline on Cypher generation failure.
+    """
+    # Generate Cypher
+    cypher, error = generate_cypher(user_query, intent, model=OLLAMA_MODEL)
+    if error:
+        return {"role": "assistant", "error": f"Cypher generation failed: {error}", "cypher": None, "sql": None}
+
+    # Execute Cypher + back-join geometry
+    result = execute_cypher(cypher)
+    if result.error:
+        return {"role": "assistant", "error": result.error, "cypher": cypher, "sql": None}
+
+    # Build a QueryResult-compatible object for analyse_stream
+    from types import SimpleNamespace
+    qr = SimpleNamespace(
+        gdf=result.gdf,
+        columns=result.columns,
+        row_count=result.row_count,
+        has_geometry=result.has_geometry,
+        error=result.error,
+        raw_rows=result.raw_rows,
+    )
+
+    # Analyse results
+    analysis = analyse_stream(user_query, cypher, qr, intent=intent)
+
+    # Build map
+    basemap = st.session_state.get("basemap_selection", "Dark (CartoDB Dark Matter)")
+    if result.has_geometry and result.gdf is not None and not result.gdf.empty:
+        map_html = build_map_html(result.gdf, basemap, device_coords, spatial_intent=intent)
+        st.session_state["current_gdf"] = result.gdf
+        st.session_state["current_intent"] = intent
+    else:
+        map_html = st.session_state.get("current_map_html") or build_default_map_html(
+            basemap, device_coords
+        )
+
+    # Build table dataframe
+    import pandas as pd
+    if result.has_geometry and result.gdf is not None:
+        table_df = result.gdf.drop(columns=["geometry"], errors="ignore").reset_index(drop=True)
+    elif result.raw_rows:
+        table_df = pd.DataFrame(result.raw_rows)
+    else:
+        table_df = None
+
+    return {
+        "role":           "assistant",
+        "summary":        analysis.summary,
+        "stats":          analysis.stats,
+        "followups":      analysis.followups,
+        "sql":            None,
+        "cypher":         cypher,          # shown in "View Cypher" expander
+        "map_html":       map_html,
+        "table_df":       table_df,
+        "row_count":      result.row_count,
+        "error":          None,
+        "_stream":        analysis.stream,
+        "spatial_intent": intent,
+    }
+
+
 # ─── core pipeline ────────────────────────────────────────────────────────────
 
 def run_pipeline(
@@ -457,6 +552,14 @@ def run_pipeline(
     history = _build_conversation_history(
         st.session_state["messages"], CONVERSATION_HISTORY_TURNS
     )
+
+    # ── Engine routing ─────────────────────────────────────────────────────
+    # Graph-traversal intents (multi-hop, path, cluster) are executed as
+    # Cypher against Apache AGE.  All other intents use PostGIS SQL.
+    if intent and intent.requires_graph and graph_is_available():
+        return _run_cypher_pipeline(
+            user_query, intent, all_tables, device_coords
+        )
 
     # 3. Generate SQL (with spatial intent context injected)
     sql, error = generate_sql(
@@ -587,7 +690,10 @@ def _render_assistant_message(msg: dict) -> None:
                 for key, val in trace.items():
                     st.markdown(f"**{key}:** {val}")
 
-    if msg.get("sql"):
+    if msg.get("cypher"):
+        with st.expander("View Cypher"):
+            st.code(msg["cypher"], language="cypher")
+    elif msg.get("sql"):
         with st.expander("View SQL"):
             st.code(msg["sql"], language="sql")
 
@@ -601,7 +707,7 @@ def _render_assistant_message(msg: dict) -> None:
 
     if msg.get("table_df") is not None and not msg["table_df"].empty:
         with st.expander("Data Table"):
-            st.dataframe(msg["table_df"], use_container_width=True)
+            st.dataframe(msg["table_df"], width="stretch")
 
     # Follow-up suggestion chips
     followups = msg.get("followups", [])
@@ -610,7 +716,7 @@ def _render_assistant_message(msg: dict) -> None:
         cols = st.columns(len(followups))
         for i, fq in enumerate(followups):
             with cols[i]:
-                if st.button(fq, key=f"fup_{hash(fq)}_{id(msg)}", use_container_width=True):
+                if st.button(fq, key=f"fup_{hash(fq)}_{id(msg)}", width="stretch"):
                     st.session_state["_pending_chat_input"] = fq
                     st.rerun()
 
@@ -716,7 +822,7 @@ def main():
 
             with st.expander("Example queries", expanded=False):
                 for q in EXAMPLE_QUERIES:
-                    if st.button(q, key=f"ex_{hash(q)}", use_container_width=True):
+                    if st.button(q, key=f"ex_{hash(q)}", width="stretch"):
                         st.session_state["_pending_chat_input"] = q
                         st.rerun()
 
@@ -837,7 +943,7 @@ def main():
                         {"Relationship": k, "Count": v}
                         for k, v in sorted(near_pairs.items(), key=lambda x: -x[1])
                     ]
-                    st.dataframe(pd.DataFrame(pairs_data), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(pairs_data), width="stretch", hide_index=True)
 
             # Example Cypher queries
             cypher_examples = [
@@ -849,7 +955,7 @@ def main():
             ]
             with st.expander("Example Cypher queries", expanded=False):
                 for ex in cypher_examples:
-                    if st.button(ex[:80] + ("..." if len(ex) > 80 else ""), key=f"cypher_ex_{hash(ex)}", use_container_width=True):
+                    if st.button(ex[:80] + ("..." if len(ex) > 80 else ""), key=f"cypher_ex_{hash(ex)}", width="stretch"):
                         st.session_state["_pending_cypher"] = ex
                         st.rerun()
 
@@ -888,7 +994,7 @@ def main():
 
                     df = pd.DataFrame(parsed)
                     st.success(f"{len(df)} rows returned")
-                    st.dataframe(df, use_container_width=True)
+                    st.dataframe(df, width="stretch")
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:

@@ -24,6 +24,8 @@
    - [geocoder.py — Map Centering](#69-geocoderpy--map-centering)
    - [spatial_concepts.py — Spatial Ontology](#610-spatial_conceptspy--spatial-ontology)
    - [spatial_reasoner.py — Semantic Reasoning Layer](#611-spatial_reasonerpy--semantic-reasoning-layer)
+   - [cypher_generator.py — Cypher Query Generator](#612-cypher_generatorpy--cypher-query-generator)
+   - [cypher_executor.py — Cypher Executor](#613-cypher_executorpy--cypher-executor)
 7. [Application Layer (`app.py`)](#7-application-layer-apppy)
 8. [End-to-End Request Flow](#8-end-to-end-request-flow)
 9. [Key Design Decisions](#9-key-design-decisions)
@@ -839,6 +841,86 @@ flowchart TD
 
 ---
 
+### 6.12 `cypher_generator.py` — Cypher Query Generator
+
+Translates natural-language graph-traversal queries into openCypher statements via an LLM call, using the AGE graph schema and few-shot examples.
+
+```
+generate_cypher(user_query, intent, model, max_retries=2)
+  │
+  ├─ _build_intent_context(intent)
+  │    └─ [GRAPH QUERY CONTEXT] block: intent type, node labels, named places,
+  │       hop-count guidance for the specific pattern
+  │
+  ├─ Ollama chat(system=SYSTEM_PROMPT + graph schema + 8 few-shots,
+  │              user=intent_context + user_query)
+  │    options: temperature=0, seed=42+attempt, num_predict=512, num_ctx=4096
+  │
+  ├─ _strip_cypher_fences(raw)   — remove ```cypher … ``` if present
+  │
+  ├─ _validate_cypher(cypher)    — reject CREATE/MERGE/DELETE/SET/REMOVE/DROP
+  │
+  └─ retry up to max_retries with error feedback on validation failure
+     Returns (cypher_str, None) | ("", error_str)
+```
+
+**Three Cypher patterns supported (8 few-shot examples total):**
+
+| Pattern | Intent | Example |
+|---|---|---|
+| Variable-length traversal | `graph_traversal` | `MATCH (s:School)-[:NEAR*1..2]->(b)` |
+| Shortest path | `path_query` | `shortestPath((s:School)-[:NEAR*]-(p:Pharmacy))` |
+| Explicit cluster | `cluster_pattern` | Three explicit NEAR edges in one MATCH |
+
+**Safety rules enforced:**
+- Read-only: rejects any write keyword (CREATE, MERGE, DELETE, SET, REMOVE, DROP)
+- Max hop depth: 4 (enforced via few-shot instruction, not regex)
+- Always returns `fid` columns so geometry can be back-joined from PostGIS
+
+---
+
+### 6.13 `cypher_executor.py` — Cypher Executor
+
+Executes the generated Cypher against AGE and back-joins PostGIS geometry so results render on the map identically to SQL query results.
+
+```
+execute_cypher(cypher) → CypherResult
+  │
+  ├─ _extract_return_columns(cypher)
+  │    └─ parse RETURN clause aliases → column name list
+  │       builds AGE's required AS (col1 agtype, col2 agtype, ...) declaration
+  │
+  ├─ _run_cypher(cypher)
+  │    └─ LOAD 'age'; SET search_path; SELECT * FROM cypher(...) AS (...)
+  │       returns raw agtype rows
+  │
+  ├─ _parse_agtype_rows(rows, columns)
+  │    └─ per-value: strip quotes / parse int/float/bool/JSON / fallback str
+  │
+  ├─ _enrich_with_geometry(parsed_rows)
+  │    ├─ _collect_fids(rows)   — find all *_fid column values
+  │    └─ _fetch_geometries(fids)
+  │         SELECT id, ST_AsGeoJSON(geometry) FROM osm_all_mat WHERE id IN (...)
+  │         → {fid: geojson_str}  (batch, single query)
+  │       merge geometry back into rows as 'geometry' column
+  │
+  └─ GeoDataFrame(geo_rows, crs="EPSG:4326") if geometry present
+     → CypherResult.gdf, .has_geometry = True
+
+CypherResult dataclass (mirrors QueryResult interface):
+  gdf:          GeoDataFrame | None
+  columns:      list[str]
+  row_count:    int
+  has_geometry: bool
+  error:        str | None
+  raw_rows:     list[dict] | None
+  cypher:       str   ← the executed Cypher (shown in "View Cypher" expander)
+```
+
+**Key design:** the geometry join uses `osm_all_mat` (the materialised UNION ALL view with a GiST index), so the batch `WHERE id IN (...)` lookup is index-accelerated regardless of which OSM layer each fid belongs to.
+
+---
+
 ## 7. Application Layer (`app.py`)
 
 ### 7.1 Session State
@@ -948,18 +1030,30 @@ flowchart TD
         F3[decompose_intent\nrule-based + optional LLM]
     end
 
-    PAR --> SCHEMA[format_schema_for_llm\ntop-4 tables + always-include]
+    PAR --> ROUTE{intent.requires_graph\n& AGE available?}
+
+    ROUTE -- Yes --> CYP[generate_cypher\nOllama: graph schema\n+ 8 few-shots]
+    CYP --> CVAL[_validate_cypher\nread-only check]
+    CVAL -- invalid --> CYP
+    CVAL -- ok --> CEXEC[execute_cypher\nAGE cypher SQL wrapper]
+    CEXEC --> GEOJOIN[_enrich_with_geometry\nbatch SELECT from osm_all_mat]
+    GEOJOIN --> CGDF[CypherResult\nGeoDataFrame or raw_rows]
+    CGDF --> ANA
+
+    ROUTE -- No --> SCHEMA[format_schema_for_llm\ntop-4 tables + always-include]
     SCHEMA --> CTX[prepend SpatialIntent\nllm_context block to query]
-    CTX --> SQL[generate_sql\nOllama: SYSTEM + 23 few-shots\n+ history + query]
+    CTX --> SQL[generate_sql\nOllama: SYSTEM + 30 few-shots\n+ history + query]
     SQL --> VAL[SQLValidator.validate\n8-step safety + sanitise]
     VAL -- ValidationError --> SQL
     VAL -- ok --> EXEC[execute_query\npsycopg3 → PostGIS]
     EXEC --> GDF{geometry\nin result?}
-    GDF -- Yes --> GEO[GeoDataFrame\nEPSG:4326]
+    GDF -- Yes --> GEO[GeoDataFrame EPSG:4326]
     GDF -- No --> RAW[raw_rows list]
-    GEO & RAW --> ANA[analyse_stream\n_compute_stats\n+ should_skip_analysis?]
+    GEO & RAW --> ANA
+
+    ANA[analyse_stream\n_compute_stats\n+ should_skip_analysis?]
     ANA --> MAP[build_map_html\nFolium + spatial overlays]
-    MAP --> RENDER[stream analysis tokens\nrender map + data table\nreasoning trace expander]
+    MAP --> RENDER[stream analysis tokens\nrender map + data table\nreasoning trace expander\nView SQL or View Cypher]
     RENDER --> DONE([session updated, st.rerun])
 ```
 

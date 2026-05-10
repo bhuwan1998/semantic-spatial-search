@@ -246,9 +246,20 @@ IntentType = Literal[
     "aggregate_stats",     # COUNT/GROUP BY / area totals
     "nearest_neighbour",   # find nearest single feature
     "topological_join",    # intersects/touches/overlaps
+    "graph_traversal",     # multi-hop reachability / connected features (→ Cypher)
+    "path_query",          # shortest path between two features (→ Cypher)
+    "cluster_pattern",     # subgraph: mutually-near feature cluster (→ Cypher)
     "mixed",               # more than one primary intent
     "unknown",
 ]
+
+# Intent types that require Cypher (Apache AGE) rather than PostGIS SQL.
+# Used by spatial_reasoner and run_pipeline to route to the correct engine.
+GRAPH_INTENT_TYPES: frozenset[str] = frozenset({
+    "graph_traversal",
+    "path_query",
+    "cluster_pattern",
+})
 
 INTENT_PATTERNS: dict[str, list[str]] = {
     "proximity_search":  ["near", "within", "km of", "m of", "metres", "meters", "around", "close to", "nearby"],
@@ -261,6 +272,21 @@ INTENT_PATTERNS: dict[str, list[str]] = {
     "aggregate_stats":   ["how many", "count", "total", "sum", "average", "largest", "biggest", "area"],
     "nearest_neighbour": ["nearest", "closest", "nearest single", "for each", "closest to"],
     "topological_join":  ["intersect", "cross", "overlap", "touch", "border"],
+    # Graph-engine intents
+    "graph_traversal":   [
+        "reachable", "connected to", "hops", "hop", "2 hops", "two hops",
+        "transitively", "chain of", "linked", "network of", "via ",
+        "through a ", "path through", "reachability",
+    ],
+    "path_query":        [
+        "shortest path", "path between", "route between", "how to get from",
+        "connected path", "graph path", "link between",
+    ],
+    "cluster_pattern":   [
+        "cluster", "clusters", "mutually near", "all near each other",
+        "co-located", "group of", "triangle of", "trio of",
+        "school hospital park", "all three near",
+    ],
 }
 
 
@@ -292,4 +318,8 @@ POSTGIS_GLOSSARY: dict[str, str] = {
     "ST_Centroid":   "centre point of a geometry",
     "ST_Azimuth":    "bearing angle from A to B (radians, clockwise from north)",
     "<->":           "KNN (k-nearest-neighbour) distance operator for ORDER BY",
+    # Cypher / AGE operators
+    "MATCH … -[:NEAR*]->":   "multi-hop traversal over pre-computed NEAR edges",
+    "shortestPath(…)":        "Cypher shortest path between two named nodes",
+    "MATCH cluster pattern":  "subgraph pattern — all three nodes mutually NEAR",
 }
